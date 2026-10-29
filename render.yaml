@@ -27,17 +27,13 @@ services:
         value: "Asia/Hebron"
       - key: CODEFORCES_REQUEST_TIMEOUT_MS
         value: "10000"
-      # Set this to the exact Vercel production URL, for example
-      # https://cp-coach.vercel.app. If left unset, the public API accepts
-      # browser requests from any origin (the API itself is tokenless).
-      - key: CORS_ORIGINS
-        sync: false
+      # Add CORS_ORIGINS in the Render dashboard after Vercel gives you the
+      # production URL, for example https://cp-coach.vercel.app. Until then the
+      # tokenless public API accepts browser requests from any origin.
       - key: ALLOW_VERCEL_PREVIEWS
         value: "true"
-      # Optional: enables the private legacy /api/admin routes. Leave unset to
-      # keep them disabled (they return 404).
-      - key: COACH_ADMIN_TOKEN
-        sync: false
+      # Optional: add COACH_ADMIN_TOKEN in the Render dashboard to enable the
+      # private legacy /api/admin routes. Without it they return 404.
       - key: SUBMISSIONS_TTL_MS
         value: "300000"
       - key: PROFILE_TTL_MS
