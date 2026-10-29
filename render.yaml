@@ -1,0 +1,52 @@
+# Render Blueprint for the public Codeforces Coach backend.
+# The frontend is deployed separately on Vercel; this service only runs the API.
+# Free instances use an ephemeral filesystem, so SQLite is intentionally kept
+# under /tmp and restored from each browser's versioned local snapshot.
+
+services:
+  - type: web
+    name: cp-coach-api
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: "npm --prefix backend install --include=dev && npm --prefix backend run build"
+    startCommand: npm --prefix backend start
+    healthCheckPath: /api/public/health
+    envVars:
+      - key: NODE_VERSION
+        value: "24.13.0"
+      - key: NODE_ENV
+        value: production
+      - key: PUBLIC_MODE
+        value: "true"
+      - key: HOST
+        value: "0.0.0.0"
+      - key: DB_DIR
+        value: "/tmp/cp_coach"
+      - key: TIMEZONE
+        value: "Asia/Hebron"
+      - key: CODEFORCES_REQUEST_TIMEOUT_MS
+        value: "10000"
+      # Set this to the exact Vercel production URL, for example
+      # https://cp-coach.vercel.app. If left unset, the public API accepts
+      # browser requests from any origin (the API itself is tokenless).
+      - key: CORS_ORIGINS
+        sync: false
+      - key: ALLOW_VERCEL_PREVIEWS
+        value: "true"
+      # Optional: enables the private legacy /api/admin routes. Leave unset to
+      # keep them disabled (they return 404).
+      - key: COACH_ADMIN_TOKEN
+        sync: false
+      - key: SUBMISSIONS_TTL_MS
+        value: "300000"
+      - key: PROFILE_TTL_MS
+        value: "300000"
+      - key: RATING_TTL_MS
+        value: "3600000"
+      - key: CONTESTS_TTL_MS
+        value: "7200000"
+      - key: PROBLEMSET_TTL_MS
+        value: "86400000"
+      - key: ACTIVE_WINDOW_MS
+        value: "1800000"

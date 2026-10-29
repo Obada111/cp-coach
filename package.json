@@ -1,0 +1,20 @@
+{
+  "name": "personal-cp-coach",
+  "version": "1.0.0",
+  "description": "Personal Competitive Programming Training Dashboard for Codeforces",
+  "scripts": {
+    "install:all": "npm --prefix backend install && npm --prefix frontend install",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build:backend": "npm --prefix backend run build",
+    "build:frontend": "npm --prefix frontend run build",
+    "build": "npm run build:backend && npm run build:frontend",
+    "test": "npm --prefix backend test",
+    "build:production": "npm run build:frontend && npm run build:backend",
+    "start:production": "cd backend && node dist/index.js",
+    "start": "npm run start:production",
+    "backup:db": "node scripts/backup-db.js"
+  },
+  "author": "Obada",
+  "license": "MIT"
+}
