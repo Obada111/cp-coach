@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   fetchDashboard, fetchProfiles, createProfile as apiCreateProfile,
   selectProfile as apiSelectProfile, triggerSync, submitProblemFeedback, fetchHistory,
-  fetchProblemJournal, replaceDailyProblem, enqueueReview, fetchReviewQueue, fetchWeeklyGoals,
+  fetchProblemJournal, replaceDailyProblem, enqueueReview, fetchReviewQueue, fetchWeeklyGoals, openProblem,
   isPublicMode, getPublicHandle, restorePublicContext, capturePublicContext, serverRestarted,
 } from './api';
 import { 
@@ -239,6 +239,25 @@ export const App: React.FC = () => {
     if (data) {
       await loadAll(data.activeProfile.id, { silent: true });
     }
+  };
+
+  const handleOpenProblem = async (dailyProblemId: string) => {
+    await openProblem(dailyProblemId);
+    const openedAt = new Date().toISOString();
+    setData((current) => {
+      if (!current?.todaySet) return current;
+      return {
+        ...current,
+        todaySet: {
+          ...current.todaySet,
+          problems: current.todaySet.problems.map((problem) => (
+            problem.id === dailyProblemId
+              ? { ...problem, isOpened: true, openedAt }
+              : problem
+          )),
+        },
+      };
+    });
   };
 
   const handleReplaceProblem = async (dailyProblemId: string) => {
@@ -737,6 +756,7 @@ export const App: React.FC = () => {
                       key={item.id} 
                       item={item} 
                       onSaveFeedback={handleFeedback}
+                      onOpenProblem={handleOpenProblem}
                       onStartSession={(prob) => setActiveSolveProblem(prob)}
                       onReplaceProblem={handleReplaceProblem}
                       onSendToReview={handleSendToReview}
