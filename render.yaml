@@ -27,9 +27,8 @@ services:
         value: "Asia/Hebron"
       - key: CODEFORCES_REQUEST_TIMEOUT_MS
         value: "10000"
-      # Add CORS_ORIGINS in the Render dashboard after Vercel gives you the
-      # production URL, for example https://cp-coach.vercel.app. Until then the
-      # tokenless public API accepts browser requests from any origin.
+      - key: CORS_ORIGINS
+        value: "https://cp-coach-six.vercel.app"
       - key: ALLOW_VERCEL_PREVIEWS
         value: "true"
       # Optional: add COACH_ADMIN_TOKEN in the Render dashboard to enable the
