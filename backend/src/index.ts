@@ -30,17 +30,21 @@ if (process.env.NODE_ENV === 'production' && !isLoopbackHost && !PUBLIC_MODE && 
   throw new Error('COACH_API_TOKEN is required when the private production backend is exposed beyond loopback');
 }
 
+const DEFAULT_PUBLIC_ORIGIN = 'https://cp-coach-six.vercel.app';
 const configuredOrigins = (process.env.CORS_ORIGINS || process.env.FRONTEND_URL || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
+const allowedOrigins = configuredOrigins.length > 0
+  ? configuredOrigins
+  : (PUBLIC_MODE && process.env.NODE_ENV === 'production' ? [DEFAULT_PUBLIC_ORIGIN] : []);
 const allowVercelPreviews = process.env.ALLOW_VERCEL_PREVIEWS === 'true';
 
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
-    if (configuredOrigins.length === 0) return callback(null, true);
-    if (configuredOrigins.includes(origin)) return callback(null, true);
+    if (allowedOrigins.length === 0) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
     if (allowVercelPreviews && /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) {
       return callback(null, true);
     }
@@ -118,7 +122,7 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 const server = app.listen(PORT, HOST, () => {
   console.log(`[CP Coach Backend] Server running on http://${HOST}:${PORT}`);
   console.log(`[CP Coach Backend] Mode: ${PUBLIC_MODE ? 'public browser-local' : 'private local'}`);
-  if (PUBLIC_MODE && configuredOrigins.length === 0) {
+  if (PUBLIC_MODE && allowedOrigins.length === 0) {
     console.log('[CP Coach Backend] CORS: allowing browser origins (set CORS_ORIGINS to restrict them).');
   }
 });
