@@ -69,8 +69,14 @@ export const App: React.FC = () => {
       setError(null);
     }
     try {
-      if (isPublicMode && getPublicHandle() && await serverRestarted()) {
-        await restorePublicContext(getPublicHandle()!);
+      const publicHandle = isPublicMode ? getPublicHandle() : null;
+      if (publicHandle && await serverRestarted()) {
+        const restore = await restorePublicContext(publicHandle);
+        if (restore.failed) {
+          throw new Error(
+            'The backend restarted and this browser\'s saved data could not be restored yet. Your local data is safe; retry in a moment.'
+          );
+        }
       }
       const dashboard = await fetchDashboard(profileId);
       dataRef.current = dashboard;
@@ -414,11 +420,12 @@ export const App: React.FC = () => {
             )}
             {(lastRefreshedAt || data.syncStatus.lastSyncedAt) && (
               <span
-                className="hidden md:inline-flex items-center gap-1 text-[11px] text-slate-500 font-mono"
+                className="inline-flex items-center gap-1 text-[11px] text-slate-500 font-mono whitespace-nowrap"
                 title={`Last successful update: ${formatDateHebron(lastRefreshedAt || data.syncStatus.lastSyncedAt)}`}
               >
                 <Clock className="w-3 h-3 text-slate-600" />
-                Updated {formatRelativeTimeAgo(lastRefreshedAt || data.syncStatus.lastSyncedAt)}
+                <span className="hidden sm:inline">Updated&nbsp;</span>
+                {formatRelativeTimeAgo(lastRefreshedAt || data.syncStatus.lastSyncedAt)}
               </span>
             )}
             <button

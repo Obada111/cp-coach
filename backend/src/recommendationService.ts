@@ -57,6 +57,7 @@ export class RecommendationService {
 
     if (existingSetRow) {
       const existingSet = this.loadDailySet(profileId, date);
+      const isIncomplete = existingSet.problems.length < 3;
       // Validate that all problems link strictly to public regular Codeforces problems (contest_id < 100000)
       const hasInvalidProblems = existingSet.problems.some(
         (p) =>
@@ -70,8 +71,8 @@ export class RecommendationService {
           p.problemId.startsWith('atcoder_') ||
           p.problemId.startsWith('102951_')
       );
-      if (hasInvalidProblems) {
-        console.log(`[Recommendation] Daily set ${existingSet.id} had restricted/Gym/non-Codeforces problems. Replacing with eligible regular public problems...`);
+      if (hasInvalidProblems || isIncomplete) {
+        console.log(`[Recommendation] Daily set ${existingSet.id} was incomplete or had restricted/Gym/non-Codeforces problems. Repairing with eligible regular public problems...`);
         const hasFeedback = existingSet.problems.some((p) => p.notes || (p.solvedStatus && p.solvedStatus !== 'NOT_SOLVED'));
         if (!hasFeedback) {
           db.prepare('DELETE FROM daily_problems WHERE daily_set_id = ?').run(existingSet.id);
@@ -455,6 +456,18 @@ export class RecommendationService {
     `).all(handle) as Array<{ problem_id: string }>;
     const excludedIds = new Set<string>(solvedRows.map((r) => r.problem_id));
 
+    // The submissions table is rebuilt from Codeforces after a cold start. The
+    // browser snapshot restores verified learning events first, so honor those
+    // too and never recommend a problem this profile has already solved.
+    const verifiedEventRows = db.prepare(`
+      SELECT DISTINCT problem_id FROM problem_learning_events
+      WHERE profile_id = ?
+        AND (verified_ac = 1 OR source = 'VERIFIED_CODEFORCES' OR solved_status = 'VERIFIED_ACCEPTED')
+    `).all(profileId) as Array<{ problem_id: string }>;
+    for (const row of verifiedEventRows) {
+      excludedIds.add(row.problem_id);
+    }
+
     // b) Solved in prior daily problems by this profile
     const solvedDailyRows = db.prepare(`
       SELECT DISTINCT problem_id FROM daily_problems
@@ -668,6 +681,13 @@ export class RecommendationService {
         learningObjective: cand3.learningObjective,
         prerequisites: cand3.prerequisites,
       });
+    }
+
+    if (recommendations.length !== 3) {
+      throw new Error(
+        `Unable to build the three daily recommendations (${recommendations.length} eligible Codeforces problems found). ` +
+        'The Codeforces problemset cache may still be syncing; retry shortly.'
+      );
     }
 
     // Strict Codeforces-only invariant validation: Every single recommended problem must link to Codeforces

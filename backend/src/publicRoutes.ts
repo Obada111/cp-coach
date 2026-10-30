@@ -125,6 +125,16 @@ export const publicRouter = Router();
 publicRouter.use((_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  // Public clients never need internal exception details. Keep the generic
+  // error label, but never forward database or filesystem messages.
+  const sendJson = res.json.bind(res);
+  res.json = ((body: any) => {
+    if (res.statusCode >= 500 && body && typeof body === 'object') {
+      return sendJson({ error: typeof body.error === 'string' ? body.error : 'Internal server error' });
+    }
+    return sendJson(body);
+  }) as typeof res.json;
   next();
 });
 

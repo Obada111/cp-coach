@@ -173,8 +173,30 @@ function trimContext(snapshot: any): any {
   };
 }
 
+function countPersonalRows(snapshot: any): number {
+  if (!snapshot || typeof snapshot !== 'object') return 0;
+  return [
+    'dailySets', 'dailyProblems', 'reviewQueue', 'solveSessions',
+    'contestReviews', 'userContests', 'weeklyGoals', 'learningEvents',
+  ].reduce((total, key) => total + (Array.isArray(snapshot[key]) ? snapshot[key].length : 0), 0);
+}
+
 function writeContext(handle: string, snapshot: any): void {
   const key = `${CONTEXT_PREFIX}${handle.trim().toLowerCase()}`;
+
+  // Never replace a richer local snapshot with an empty server snapshot. This
+  // can happen if a health check misses a restart and the first dashboard
+  // request lands on a fresh ephemeral database. Keeping the local snapshot
+  // lets the next refresh restore it.
+  const existingRaw = readStorage(key);
+  if (existingRaw && countPersonalRows(snapshot) === 0) {
+    try {
+      if (countPersonalRows(JSON.parse(existingRaw)) > 0) return;
+    } catch {
+      // Corrupt local data can be replaced by the server snapshot.
+    }
+  }
+
   let value = JSON.stringify(trimContext(snapshot));
   if (writeStorage(key, value)) return;
 
@@ -211,14 +233,38 @@ export async function capturePublicContext(handle: string | null = currentHandle
   return captureInFlight;
 }
 
-export async function restorePublicContext(handle: string): Promise<{ restored: boolean; counts?: Record<string, number> }> {
+let instanceCheck: Promise<boolean> | null = null;
+let lastInstanceCheckAt = 0;
+let pendingServerInstanceId: string | null = null;
+
+function acknowledgeServerInstance(): void {
+  if (pendingServerInstanceId) {
+    writeStorage(SERVER_INSTANCE_KEY, pendingServerInstanceId);
+    pendingServerInstanceId = null;
+  }
+  lastInstanceCheckAt = Date.now();
+}
+
+export async function restorePublicContext(
+  handle: string
+): Promise<{ restored: boolean; failed?: boolean; counts?: Record<string, number> }> {
   if (!isPublicMode) return { restored: false };
   const key = `${CONTEXT_PREFIX}${handle.trim().toLowerCase()}`;
   const raw = readStorage(key);
-  if (!raw) return { restored: false };
+  if (!raw) {
+    acknowledgeServerInstance();
+    return { restored: false };
+  }
+
+  let context: unknown;
+  try {
+    context = JSON.parse(raw);
+  } catch {
+    acknowledgeServerInstance();
+    return { restored: false };
+  }
 
   try {
-    const context = JSON.parse(raw);
     const res = await globalThis.fetch(`${API_BASE}/context`, {
       method: 'POST',
       headers: {
@@ -227,21 +273,21 @@ export async function restorePublicContext(handle: string): Promise<{ restored: 
       },
       body: JSON.stringify({ context }),
     });
-    if (!res.ok) return { restored: false };
-    const data = await res.json();
+    if (!res.ok) return { restored: false, failed: true };
+    const data = await res.json().catch(() => ({}));
+    acknowledgeServerInstance();
     return { restored: true, counts: data.counts };
   } catch {
-    return { restored: false };
+    return { restored: false, failed: true };
   }
 }
-
-let instanceCheck: Promise<boolean> | null = null;
-let lastInstanceCheckAt = 0;
 
 /**
  * Detect a backend restart (Render free instances lose their ephemeral DB).
  * When the instance changes, the caller re-uploads this browser's snapshot
- * before loading the dashboard.
+ * before loading the dashboard. The new instance ID is only acknowledged after
+ * a successful restore, so a transient failure is retried instead of silently
+ * replacing the local snapshot with an empty dashboard.
  */
 export async function serverRestarted(): Promise<boolean> {
   if (!isPublicMode) return false;
@@ -256,9 +302,17 @@ export async function serverRestarted(): Promise<boolean> {
       const instanceId = typeof data.instanceId === 'string' ? data.instanceId : '';
       if (!instanceId) return false;
       const previous = readStorage(SERVER_INSTANCE_KEY);
-      writeStorage(SERVER_INSTANCE_KEY, instanceId);
-      lastInstanceCheckAt = Date.now();
-      return Boolean(previous && previous !== instanceId);
+      if (!previous) {
+        writeStorage(SERVER_INSTANCE_KEY, instanceId);
+        lastInstanceCheckAt = Date.now();
+        return false;
+      }
+      if (previous === instanceId) {
+        lastInstanceCheckAt = Date.now();
+        return false;
+      }
+      pendingServerInstanceId = instanceId;
+      return true;
     } catch {
       return false;
     } finally {
