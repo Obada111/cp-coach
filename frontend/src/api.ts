@@ -15,7 +15,10 @@ import {
   ,ProblemLearningEvent
 } from './types';
 
-const API_ORIGIN = ((import.meta.env.VITE_API_BASE_URL as string | undefined) || '').trim().replace(/\/+$/, '');
+const FALLBACK_PUBLIC_API_ORIGIN = 'https://cp-coach-api-9wk2.onrender.com';
+const configuredApiOrigin = ((import.meta.env.VITE_API_BASE_URL as string | undefined) || '').trim().replace(/\/+$/, '');
+const isVercelHost = typeof window !== 'undefined' && /(^|\.)vercel\.app$/i.test(window.location.hostname);
+const API_ORIGIN = configuredApiOrigin || (isVercelHost ? FALLBACK_PUBLIC_API_ORIGIN : '');
 export const isPublicMode = import.meta.env.VITE_PUBLIC_MODE === 'true' || Boolean(API_ORIGIN);
 const API_BASE = `${API_ORIGIN}${isPublicMode ? '/api/public' : '/api'}`;
 
