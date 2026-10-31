@@ -4,6 +4,7 @@ import { contestService } from './contestService.js';
 import { SyncStatus } from './types.js';
 import { problemJournalService } from './problemJournalService.js';
 import { randomUUID } from 'node:crypto';
+import type { TimingSink } from './perf.js';
 
 export interface DataFreshness {
   submissionsLastRefreshed: string | null;
@@ -153,7 +154,7 @@ export class CodeforcesCacheService {
     };
   }
 
-  private async refreshProblemsetIfNeeded(force: boolean): Promise<void> {
+  private async refreshProblemsetIfNeeded(force: boolean, trace?: TimingSink): Promise<void> {
     const problemCount = (db.prepare('SELECT COUNT(*) AS count FROM problems').get() as { count: number }).count;
     const lastRefresh = this.getMetaTimestamp('last_problemset_refresh');
     if (!force && problemCount >= 100 && !this.isStale(lastRefresh, this.PROBLEMSET_TTL_MS)) return;
@@ -162,7 +163,10 @@ export class CodeforcesCacheService {
 
     const task = (async () => {
       try {
+        const fetchStarted = performance.now();
         const problemset = await codeforcesService.getProblemset();
+        trace?.add('sync.problemsetFetch', performance.now() - fetchStarted);
+        const writeStarted = performance.now();
         const insertProblem = db.prepare(`
           INSERT INTO problems (id, contest_id, problem_index, name, type, rating, tags, solved_count, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
@@ -204,6 +208,7 @@ export class CodeforcesCacheService {
           try { db.exec('ROLLBACK'); } catch {}
           throw error;
         }
+        trace?.add('sync.problemsetWrite', performance.now() - writeStarted);
         this.setMetaValue('last_problemset_refresh', new Date().toISOString());
       } finally {
         this.releaseLease('problemset_sync');
@@ -224,7 +229,11 @@ export class CodeforcesCacheService {
    * Deduplicates concurrent calls via inFlightSyncs.
    * Handles API errors gracefully without wiping existing cached data.
    */
-  async autoRefreshIfNeeded(profileIdOrHandle: string, force = false): Promise<ExtendedSyncStatus> {
+  async autoRefreshIfNeeded(
+    profileIdOrHandle: string,
+    force = false,
+    trace?: TimingSink,
+  ): Promise<ExtendedSyncStatus> {
     const profile = getProfileById(profileIdOrHandle) || getProfileByHandle(profileIdOrHandle);
     if (!profile) {
       throw new Error(`Profile '${profileIdOrHandle}' not found`);
@@ -239,7 +248,9 @@ export class CodeforcesCacheService {
       return this.inFlightSyncs.get(handleLower)!;
     }
 
+    const freshnessStarted = performance.now();
     const freshness = this.getFreshnessStatus(handle, profileId);
+    trace?.add('sync.freshness', performance.now() - freshnessStarted);
 
     // If everything is fresh and force is false, return immediately without network call
     if (!force && !freshness.dataFreshness.isAnyStale && freshness.submissionsCount > 0) {
@@ -255,6 +266,7 @@ export class CodeforcesCacheService {
 
     const syncPromise = (async (): Promise<ExtendedSyncStatus> => {
       let syncError: string | null = null;
+      let stageStarted = 0;
       try {
         const nowIso = new Date().toISOString();
 
@@ -263,7 +275,9 @@ export class CodeforcesCacheService {
         if (needSubs) {
           try {
             // Fetch User Info
+            stageStarted = performance.now();
             const userInfo = await codeforcesService.getUserInfo(handle);
+            trace?.add('sync.userInfo', performance.now() - stageStarted);
             if (userInfo) {
               db.prepare(`
                 INSERT INTO profile_cache (handle, rating, max_rating, rank, max_rank, avatar, title_photo, organization, city, country, raw_json, updated_at)
@@ -307,10 +321,13 @@ export class CodeforcesCacheService {
             // Fetch Submissions: Full 4000 on first sync or force; recent 150 on incremental refresh
             const subCount = freshness.submissionsCount;
             const fetchCount = (force || subCount === 0) ? 4000 : 150;
+            stageStarted = performance.now();
             const submissions = await codeforcesService.getUserStatus(handle, fetchCount);
+            trace?.add('sync.submissionsFetch', performance.now() - stageStarted);
 
             if (submissions !== null) {
               if (submissions.length > 0) {
+              stageStarted = performance.now();
               const insertSub = db.prepare(`
                 INSERT OR REPLACE INTO submissions (id, handle, problem_id, contest_id, problem_index, verdict, creation_time, programming_language, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -356,6 +373,7 @@ export class CodeforcesCacheService {
 
               // Update verified ACs for active daily problems
               syncProfileVerifiedAC(profileId, handle);
+              trace?.add('sync.submissionsWrite', performance.now() - stageStarted);
               }
               // An empty successful response is still a successful refresh.
               this.setMetaValue(`last_submissions_refresh_${handleLower}`, nowIso);
@@ -370,9 +388,12 @@ export class CodeforcesCacheService {
         const needRating = force || freshness.dataFreshness.isRatingStale;
         if (needRating) {
           try {
+            stageStarted = performance.now();
             const ratings = await codeforcesService.getUserRating(handle);
+            trace?.add('sync.ratingFetch', performance.now() - stageStarted);
             if (ratings !== null) {
               if (ratings.length > 0) {
+              stageStarted = performance.now();
               const insertRating = db.prepare(`
                 INSERT INTO rating_history (handle, contest_id, contest_name, rank, rating_update_time, old_rating, new_rating)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -403,6 +424,7 @@ export class CodeforcesCacheService {
                 throw e;
               }
               }
+              trace?.add('sync.ratingWrite', performance.now() - stageStarted);
               // Unrated users legitimately have an empty rating history.
               this.setMetaValue(`last_rating_refresh_${handleLower}`, nowIso);
             }
@@ -416,7 +438,9 @@ export class CodeforcesCacheService {
         const needContests = force || freshness.dataFreshness.isContestsStale;
         if (needContests) {
           try {
-            await contestService.detectAndSyncContests(profileId);
+            stageStarted = performance.now();
+            await contestService.detectAndSyncContests(profileId, trace);
+            trace?.add('sync.contests', performance.now() - stageStarted);
             this.setMetaValue(`last_contests_refresh_${profileId}`, nowIso);
             this.setMetaValue('last_contests_refresh_global', nowIso);
           } catch (cErr: any) {
@@ -429,7 +453,9 @@ export class CodeforcesCacheService {
         // method uses its own global lease so multiple profiles/processes do
         // not download or write the problemset concurrently.
         try {
-          await this.refreshProblemsetIfNeeded(force);
+          stageStarted = performance.now();
+          await this.refreshProblemsetIfNeeded(force, trace);
+          trace?.add('sync.problemset', performance.now() - stageStarted);
         } catch (problemsetErr: any) {
           console.warn('[CacheService] Problemset refresh error:', problemsetErr.message);
           if (!syncError) syncError = problemsetErr.message;

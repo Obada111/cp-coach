@@ -36,6 +36,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { TutorialModal } from './TutorialModal';
+import { VirtualContestSession } from './VirtualContestSession';
 
 interface Props {
   profileId: string;
@@ -86,6 +87,7 @@ export const ContestsView: React.FC<Props> = ({ profileId, onNavigateToPractice 
   const [activeTutorial, setActiveTutorial] = useState<ProblemTutorial | null>(null);
   const [tutorialModalOpen, setTutorialModalOpen] = useState(false);
   const [loadingTutorialIndex, setLoadingTutorialIndex] = useState<string | null>(null);
+  const [virtualMode, setVirtualMode] = useState(false);
 
   // Load contest list
   const loadContests = useCallback(async () => {
@@ -255,8 +257,27 @@ export const ContestsView: React.FC<Props> = ({ profileId, onNavigateToPractice 
   }
 
   if (selectedContestId && postMortem) {
+    if (virtualMode) {
+      return (
+        <VirtualContestSession
+          profileId={profileId}
+          handle={postMortem.handle}
+          contestId={postMortem.contestId}
+          name={postMortem.name}
+          durationSeconds={postMortem.durationSeconds}
+          problems={postMortem.problems}
+          onClose={() => setVirtualMode(false)}
+        />
+      );
+    }
+
     const hasDelta = postMortem.ratingChange !== null && postMortem.ratingChange !== undefined;
     const isPositive = (postMortem.ratingChange || 0) >= 0;
+    const canStartVirtualContest =
+      postMortem.contestId > 0 &&
+      postMortem.contestId < 100000 &&
+      postMortem.startTimeSeconds + postMortem.durationSeconds < Math.floor(Date.now() / 1000) &&
+      postMortem.problems.length > 0;
 
     return (
       <div className="space-y-6">
@@ -300,6 +321,16 @@ export const ContestsView: React.FC<Props> = ({ profileId, onNavigateToPractice 
                 )}
               </div>
             </div>
+
+            {canStartVirtualContest && (
+              <button
+                type="button"
+                onClick={() => setVirtualMode(true)}
+                className="px-3 py-2 rounded-lg bg-indigo-700 hover:bg-indigo-600 text-xs font-semibold text-white"
+              >
+                Start Virtual Contest
+              </button>
+            )}
 
             {/* Rating Change Display */}
             {hasDelta && (

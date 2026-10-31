@@ -416,8 +416,11 @@ export class AnalysisService {
       const solveRate = distinctAttempted > 0 ? (distinctSolved / distinctAttempted) * 100 : 0;
       const recentSolveRate = stats.recentAttempted > 0 ? (stats.recentSolved / stats.recentAttempted) * 100 : solveRate;
 
-      // Evidence threshold: either >= 3 attempts on Codeforces, or at least 1 explicit training feedback
+      // One negative signal is enough to flag a weakness, but strength/mastery
+      // needs either 3 distinct Codeforces attempts or 2 distinct feedback
+      // records. A single solved problem must never become "mastered".
       const hasSufficientEvidence = distinctAttempted >= 3 || fb.totalFeedbackCount >= 1;
+      const hasStrongEvidence = distinctAttempted >= 3 || fb.totalFeedbackCount >= 2;
 
       let status: TopicStatus;
       let confidence: TopicConfidence;
@@ -426,7 +429,7 @@ export class AnalysisService {
       let recommendedNextStep = '';
       let recentTrend: 'IMPROVING' | 'STABLE' | 'DECLINING' = 'STABLE';
 
-      if (stats.recentAttempted >= 3) {
+      if (hasStrongEvidence && stats.recentAttempted >= 3) {
         if (recentSolveRate >= solveRate + 12 || fb.recentEasyIndependent) {
           recentTrend = 'IMPROVING';
         } else if (recentSolveRate <= solveRate - 15 || fb.recentHardOrHints) {
@@ -493,6 +496,12 @@ export class AnalysisService {
           }
           explanation = `Weakness identified: ${reasons.join(', ')}. Target rating ~${Math.max(800, userRating - 100)} to solidify fundamentals.`;
           recommendedNextStep = `Drill foundational ~${Math.max(800, userRating - 100)} problems independently without opening editorial.`;
+        } else if (!hasStrongEvidence) {
+          status = 'UNEXPLORED';
+          confidence = 'LOW';
+          weaknessScore = Math.max(20, weaknessScore);
+          explanation = 'Only one positive training signal is recorded for this topic. That is not enough evidence to call it a strength.';
+          recommendedNextStep = `Solve 1-2 more ${tag} problems, and record whether each solution was independent or assisted.`;
         } else {
           status = 'STRONG';
           const reasons: string[] = [];
@@ -512,13 +521,13 @@ export class AnalysisService {
 
       // Mastery score: Positive metric 0-100
       let masteryScore = Math.max(0, Math.min(100, 100 - weaknessScore));
-      if (!hasSufficientEvidence) {
+      if (!hasSufficientEvidence || status === 'UNEXPLORED') {
         masteryScore = 15;
       }
 
       // Determine mastery tier
       let masteryTier: 'MASTERED' | 'PROFICIENT' | 'DEVELOPING' | 'EMERGING' | 'UNEXPLORED';
-      if (!hasSufficientEvidence) {
+      if (!hasSufficientEvidence || status === 'UNEXPLORED') {
         masteryTier = 'UNEXPLORED';
       } else if (masteryScore >= 80 && confidence === 'HIGH') {
         masteryTier = 'MASTERED';

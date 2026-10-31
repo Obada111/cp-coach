@@ -85,7 +85,7 @@ export class ContestService {
    * Automatically detect all contests where the user has participation evidence
    * (either in rating_history or via contest submissions)
    */
-  async detectAndSyncContests(profileId: string): Promise<UserContestSummary[]> {
+  async detectAndSyncContests(profileId: string, trace?: import('./perf.js').TimingSink): Promise<UserContestSummary[]> {
     const profile = getProfileById(profileId);
     if (!profile) throw new Error(`Profile '${profileId}' not found`);
     const handle = profile.handle;
@@ -105,20 +105,36 @@ export class ContestService {
       new_rating: number;
     }>;
 
-    // 2. Contests from submissions (includes virtual and unrated practice)
-    const subContestRows = db.prepare(`
-      SELECT DISTINCT contest_id
+    // 2. Contests and per-contest submission stats in a single grouped scan.
+    const submissionStatsRows = db.prepare(`
+      SELECT
+        contest_id,
+        MIN(creation_time) as min_time,
+        MAX(creation_time) as max_time,
+        COUNT(*) as sub_count,
+        COUNT(DISTINCT CASE WHEN verdict = 'OK' THEN problem_id END) as solved_count,
+        COUNT(DISTINCT problem_id) as attempted_count
       FROM submissions
       WHERE handle = ? AND contest_id IS NOT NULL AND contest_id > 0 AND contest_id < 100000
-    `).all(handle) as Array<{ contest_id: number }>;
+      GROUP BY contest_id
+    `).all(handle) as Array<{
+      contest_id: number;
+      min_time: number | null;
+      max_time: number | null;
+      sub_count: number;
+      solved_count: number;
+      attempted_count: number;
+    }>;
+    const submissionStatsByContest = new Map(submissionStatsRows.map((row) => [row.contest_id, row]));
 
     const allContestIds = new Set<number>();
     ratingRows.forEach((r) => allContestIds.add(r.contest_id));
-    subContestRows.forEach((r) => allContestIds.add(r.contest_id));
+    submissionStatsRows.forEach((r) => allContestIds.add(r.contest_id));
 
     // 0. Pre-fetch public official contests to get genuine names and start times
     const contestMetaMap = new Map<number, { name: string; startTimeSeconds: number; durationSeconds: number }>();
     let publicContests: any[] | null = null;
+    const metaFetchStarted = performance.now();
     try {
       publicContests = await throttledFetch<any[]>(`${CF_API_BASE}/contest.list?gym=false`);
       if (publicContests && Array.isArray(publicContests)) {
@@ -133,10 +149,12 @@ export class ContestService {
         }
       }
     } catch {}
+    trace?.add('contest.metaFetch', performance.now() - metaFetchStarted);
 
     // Keep the shared official contest metadata cache warm for recommendation
     // recency ranking, even when this refresh is initiated through the
     // dashboard contest path rather than the full profile sync.
+    const metaWriteStarted = performance.now();
     if (contestMetaMap.size > 0) {
       const upsertOfficialContest = db.prepare(`
         INSERT INTO codeforces_contests
@@ -149,126 +167,124 @@ export class ContestService {
           phase = excluded.phase,
           updated_at = datetime('now')
       `);
-      for (const [contestId, metadata] of contestMetaMap) {
-        if (metadata.startTimeSeconds > 0) {
-          upsertOfficialContest.run(
-            contestId,
-            metadata.name,
-            metadata.startTimeSeconds,
-            metadata.durationSeconds,
-            null
-          );
+      db.exec('BEGIN TRANSACTION');
+      try {
+        for (const [contestId, metadata] of contestMetaMap) {
+          if (metadata.startTimeSeconds > 0) {
+            upsertOfficialContest.run(
+              contestId,
+              metadata.name,
+              metadata.startTimeSeconds,
+              metadata.durationSeconds,
+              null
+            );
+          }
         }
+        db.exec('COMMIT');
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch {}
+        throw error;
       }
     }
+
+    trace?.add('contest.metaWrite', performance.now() - metaWriteStarted);
 
     // Upsert each contest record idempotently
-    for (const cId of allContestIds) {
-      const ratingInfo = ratingRows.find((r) => r.contest_id === cId);
-      const cfMeta = contestMetaMap.get(cId);
+    const rowsStarted = performance.now();
+    const ratingById = new Map(ratingRows.map((row) => [row.contest_id, row]));
+    const problemNameStatement = db.prepare('SELECT name FROM problems WHERE contest_id = ? LIMIT 1');
+    const upsertContest = db.prepare(`
+      INSERT INTO user_contests (
+        id, profile_id, contest_id, name, start_time_seconds, duration_seconds,
+        participation_type, rank, old_rating, new_rating, rating_change,
+        problems_solved, problems_attempted, total_submissions, is_official, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(profile_id, contest_id) DO UPDATE SET
+        name = excluded.name,
+        participation_type = excluded.participation_type,
+        start_time_seconds = excluded.start_time_seconds,
+        duration_seconds = excluded.duration_seconds,
+        rank = COALESCE(excluded.rank, user_contests.rank),
+        old_rating = COALESCE(excluded.old_rating, user_contests.old_rating),
+        new_rating = COALESCE(excluded.new_rating, user_contests.new_rating),
+        rating_change = COALESCE(excluded.rating_change, user_contests.rating_change),
+        problems_solved = excluded.problems_solved,
+        problems_attempted = excluded.problems_attempted,
+        total_submissions = excluded.total_submissions,
+        is_official = excluded.is_official,
+        updated_at = datetime('now')
+    `);
+    const finishedRounds = publicContests && Array.isArray(publicContests)
+      ? publicContests.filter((c) => c.phase === 'FINISHED' && c.id < 100000).slice(0, 50)
+      : [];
+    const insertMissed = db.prepare(`
+      INSERT INTO user_contests (
+        id, profile_id, contest_id, name, start_time_seconds, duration_seconds,
+        participation_type, rank, old_rating, new_rating, rating_change,
+        problems_solved, problems_attempted, total_submissions, is_official, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, 'MISSED', NULL, NULL, NULL, NULL, 0, 0, 0, 1, datetime('now'))
+      ON CONFLICT(profile_id, contest_id) DO NOTHING
+    `);
 
-      // Check earliest submission time for this contest
-      const subStats = db.prepare(`
-        SELECT 
-          MIN(creation_time) as min_time,
-          MAX(creation_time) as max_time,
-          COUNT(*) as sub_count
-        FROM submissions
-        WHERE handle = ? AND contest_id = ?
-      `).get(handle, cId) as { min_time: number | null; max_time: number | null; sub_count: number };
+    db.exec('BEGIN TRANSACTION');
+    try {
+      for (const cId of allContestIds) {
+        const ratingInfo = ratingById.get(cId);
+        const cfMeta = contestMetaMap.get(cId);
 
-      let name = ratingInfo?.contest_name || cfMeta?.name;
-      if (!name) {
-        const probRow = db.prepare('SELECT name FROM problems WHERE contest_id = ? LIMIT 1').get(cId) as { name: string } | undefined;
-        name = probRow ? `Codeforces Contest ${cId}` : `Contest #${cId}`;
+        // Submission stats were collected for every contest in one scan.
+        const subStats = submissionStatsByContest.get(cId) || {
+          min_time: null,
+          max_time: null,
+          sub_count: 0,
+          solved_count: 0,
+          attempted_count: 0,
+        };
+
+        let name = ratingInfo?.contest_name || cfMeta?.name;
+        if (!name) {
+          const probRow = problemNameStatement.get(cId) as { name: string } | undefined;
+          name = probRow ? `Codeforces Contest ${cId}` : `Contest #${cId}`;
+        }
+
+        const durationSeconds = cfMeta?.durationSeconds || 7200; // Standard 2h
+        let startTime = ratingInfo ? ratingInfo.rating_update_time - durationSeconds : (cfMeta?.startTimeSeconds || subStats.min_time || Math.floor(Date.now() / 1000));
+        if (subStats.min_time && subStats.min_time < startTime) {
+          startTime = subStats.min_time;
+        }
+
+        const participationType: ContestParticipationType = ratingInfo ? 'RATED' : 'PRACTICE';
+        const ratingChange = ratingInfo ? ratingInfo.new_rating - ratingInfo.old_rating : null;
+        const isOfficial = ratingInfo || cfMeta ? 1 : 0;
+
+        const contestRecordId = `c_${profileId}_${cId}`;
+
+        upsertContest.run(
+          contestRecordId,
+          profileId,
+          cId,
+          name,
+          startTime,
+          durationSeconds,
+          participationType,
+          ratingInfo?.rank ?? null,
+          ratingInfo?.old_rating ?? null,
+          ratingInfo?.new_rating ?? null,
+          ratingChange,
+          subStats.solved_count,
+          subStats.attempted_count,
+          subStats.sub_count,
+          isOfficial
+        );
       }
 
-      const durationSeconds = cfMeta?.durationSeconds || 7200; // Standard 2h
-      let startTime = ratingInfo ? ratingInfo.rating_update_time - durationSeconds : (cfMeta?.startTimeSeconds || subStats.min_time || Math.floor(Date.now() / 1000));
-      if (subStats.min_time && subStats.min_time < startTime) {
-        startTime = subStats.min_time;
-      }
-
-      const participationType: ContestParticipationType = ratingInfo ? 'RATED' : 'PRACTICE';
-      const ratingChange = ratingInfo ? ratingInfo.new_rating - ratingInfo.old_rating : null;
-      const isOfficial = ratingInfo || cfMeta ? 1 : 0;
-
-      // Count solved and attempted problems
-      const solvedCountRow = db.prepare(`
-        SELECT COUNT(DISTINCT problem_id) as count
-        FROM submissions
-        WHERE handle = ? AND contest_id = ? AND verdict = 'OK'
-      `).get(handle, cId) as { count: number };
-
-      const attemptedCountRow = db.prepare(`
-        SELECT COUNT(DISTINCT problem_id) as count
-        FROM submissions
-        WHERE handle = ? AND contest_id = ?
-      `).get(handle, cId) as { count: number };
-
-      const contestRecordId = `c_${profileId}_${cId}`;
-
-      db.prepare(`
-        INSERT INTO user_contests (
-          id, profile_id, contest_id, name, start_time_seconds, duration_seconds,
-          participation_type, rank, old_rating, new_rating, rating_change,
-          problems_solved, problems_attempted, total_submissions, is_official, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        ON CONFLICT(profile_id, contest_id) DO UPDATE SET
-          name = excluded.name,
-          participation_type = excluded.participation_type,
-          start_time_seconds = excluded.start_time_seconds,
-          duration_seconds = excluded.duration_seconds,
-          rank = COALESCE(excluded.rank, user_contests.rank),
-          old_rating = COALESCE(excluded.old_rating, user_contests.old_rating),
-          new_rating = COALESCE(excluded.new_rating, user_contests.new_rating),
-          rating_change = COALESCE(excluded.rating_change, user_contests.rating_change),
-          problems_solved = excluded.problems_solved,
-          problems_attempted = excluded.problems_attempted,
-          total_submissions = excluded.total_submissions,
-          is_official = excluded.is_official,
-          updated_at = datetime('now')
-      `).run(
-        contestRecordId,
-        profileId,
-        cId,
-        name,
-        startTime,
-        durationSeconds,
-        participationType,
-        ratingInfo?.rank ?? null,
-        ratingInfo?.old_rating ?? null,
-        ratingInfo?.new_rating ?? null,
-        ratingChange,
-        solvedCountRow.count,
-        attemptedCountRow.count,
-        subStats.sub_count,
-        isOfficial
-      );
-    }
-
-    // 3. Sync recent official Codeforces Div rounds to enable tracking every Div
-    if (publicContests && Array.isArray(publicContests)) {
-      const finishedRounds = publicContests
-        .filter((c) => c.phase === 'FINISHED' && c.id < 100000)
-        .slice(0, 50);
-
-      const insertMissed = db.prepare(`
-        INSERT INTO user_contests (
-          id, profile_id, contest_id, name, start_time_seconds, duration_seconds,
-          participation_type, rank, old_rating, new_rating, rating_change,
-          problems_solved, problems_attempted, total_submissions, is_official, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, 'MISSED', NULL, NULL, NULL, NULL, 0, 0, 0, 1, datetime('now'))
-        ON CONFLICT(profile_id, contest_id) DO NOTHING
-      `);
-
+      // 3. Sync recent official Codeforces Div rounds to enable tracking every Div
       for (const c of finishedRounds) {
         if (!allContestIds.has(c.id)) {
-          const contestRecordId = `c_${profileId}_${c.id}`;
           insertMissed.run(
-            contestRecordId,
+            `c_${profileId}_${c.id}`,
             profileId,
             c.id,
             c.name,
@@ -277,7 +293,12 @@ export class ContestService {
           );
         }
       }
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch {}
+      throw error;
     }
+    trace?.add('contest.rows', performance.now() - rowsStarted);
 
     return this.getContestList(profileId);
   }

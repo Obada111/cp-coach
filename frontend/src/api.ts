@@ -13,7 +13,31 @@ import {
   SessionAnalytics,
   WeeklyGoal
   ,ProblemLearningEvent
+  ,WeeklyCoachReport
 } from './types';
+import {
+  BackupMode,
+  BrowserBackup,
+  BROWSER_BACKUP_FORMAT,
+  BROWSER_BACKUP_VERSION,
+  BrowserStorageTransactionError,
+  MAX_BROWSER_BACKUP_BYTES,
+  applyBrowserStorageChanges,
+  restoreBrowserStorageValues,
+  serverContextImportSequence,
+  snapshotBrowserStorage,
+  validateBrowserBackup,
+} from './dataBackup';
+import {
+  knowledgeNotesStorageKey,
+  mergeKnowledgeNotes,
+  readKnowledgeNotes,
+} from './knowledgeJournal';
+import {
+  listVirtualContestSessions,
+  virtualContestStorageKey,
+} from './virtualContest';
+import { recordRequest } from './perf';
 
 const FALLBACK_PUBLIC_API_ORIGIN = 'https://cp-coach-api-9wk2.onrender.com';
 const configuredApiOrigin = ((import.meta.env.VITE_API_BASE_URL as string | undefined) || '').trim().replace(/\/+$/, '');
@@ -27,7 +51,9 @@ const HANDLES_KEY = 'cp-coach:handles:v1';
 const ACTIVE_HANDLE_KEY = 'cp-coach:active-handle:v1';
 const CONTEXT_PREFIX = 'cp-coach:context:v1:';
 const SERVER_INSTANCE_KEY = 'cp-coach:server-instance:v1';
+const OFFLINE_SNAPSHOT_KEY = 'cp-coach:offline-dashboard:v1';
 const HANDLE_PATTERN = /^[A-Za-z0-9_.-]{2,64}$/;
+const inFlightPublicRequests = new Map<string, Promise<Response>>();
 
 function readStorage(key: string): string | null {
   try {
@@ -158,24 +184,6 @@ function rememberProfiles(profiles: UserProfile[]): void {
   }
 }
 
-function trimContext(snapshot: any): any {
-  if (!snapshot || typeof snapshot !== 'object') return snapshot;
-  const trim = (value: unknown, max: number) => Array.isArray(value) ? value.slice(0, max) : value;
-  return {
-    ...snapshot,
-    dailySets: trim(snapshot.dailySets, 60),
-    dailyProblems: trim(snapshot.dailyProblems, 240),
-    reviewQueue: trim(snapshot.reviewQueue, 250),
-    solveSessions: trim(snapshot.solveSessions, 200),
-    contestReviews: trim(snapshot.contestReviews, 200),
-    userContests: trim(snapshot.userContests, 200),
-    weeklyGoals: trim(snapshot.weeklyGoals, 52),
-    learningEvents: trim(snapshot.learningEvents, 500),
-    problems: trim(snapshot.problems, 1000),
-    contestProblemsMeta: trim(snapshot.contestProblemsMeta, 1000),
-  };
-}
-
 function countPersonalRows(snapshot: any): number {
   if (!snapshot || typeof snapshot !== 'object') return 0;
   return [
@@ -200,33 +208,54 @@ function writeContext(handle: string, snapshot: any): void {
     }
   }
 
-  let value = JSON.stringify(trimContext(snapshot));
-  if (writeStorage(key, value)) return;
-
-  const minimal = {
-    ...snapshot,
-    learningEvents: Array.isArray(snapshot.learningEvents) ? snapshot.learningEvents.slice(0, 150) : [],
-    solveSessions: Array.isArray(snapshot.solveSessions) ? snapshot.solveSessions.slice(0, 75) : [],
-    problems: Array.isArray(snapshot.problems) ? snapshot.problems.slice(0, 400) : [],
-  };
-  value = JSON.stringify(minimal);
-  if (!writeStorage(key, value)) {
-    removeStorage(key);
+  const value = JSON.stringify(snapshot);
+  if (!writeStorage(key, value) || readStorage(key) !== value) {
+    console.warn(`Could not persist the complete training snapshot for '${handle}'; the previous snapshot was kept.`);
   }
 }
 
-export async function capturePublicContext(handle: string | null = currentHandle): Promise<void> {
+const CONTEXT_CAPTURE_INTERVAL_MS = 5 * 60 * 1000;
+const CONTEXT_CAPTURE_AT_PREFIX = 'cp-coach:context-captured-at:v1:';
+const lastContextCaptureAt = new Map<string, number>();
+
+function readLastContextCaptureAt(captureKey: string): number {
+  const cached = lastContextCaptureAt.get(captureKey);
+  if (cached !== undefined) return cached;
+  const stored = Number(readStorage(`${CONTEXT_CAPTURE_AT_PREFIX}${captureKey}`) || 0);
+  const timestamp = Number.isFinite(stored) ? stored : 0;
+  lastContextCaptureAt.set(captureKey, timestamp);
+  return timestamp;
+}
+
+function rememberContextCapture(captureKey: string): void {
+  const timestamp = Date.now();
+  lastContextCaptureAt.set(captureKey, timestamp);
+  writeStorage(`${CONTEXT_CAPTURE_AT_PREFIX}${captureKey}`, String(timestamp));
+}
+
+export async function capturePublicContext(
+  handle: string | null = currentHandle,
+  options: { force?: boolean } = {}
+): Promise<void> {
   if (!isPublicMode || !handle) return;
   if (captureInFlight) return captureInFlight;
+
+  const captureKey = handle.trim().toLowerCase();
+  const lastCaptureAt = readLastContextCaptureAt(captureKey);
+  if (!options.force && Date.now() - lastCaptureAt < CONTEXT_CAPTURE_INTERVAL_MS) return;
 
   const task = (async () => {
     try {
       const res = await globalThis.fetch(`${API_BASE}/context`, { headers: publicHeaders(handle) });
-      if (!res.ok) return;
+      if (!res.ok) {
+        console.warn(`Could not capture the complete training snapshot for '${handle}': server returned ${res.status}.`);
+        return;
+      }
       const snapshot = await res.json();
       writeContext(handle, snapshot);
-    } catch {
-      // Context capture is best-effort; the next successful refresh retries.
+      rememberContextCapture(captureKey);
+    } catch (error) {
+      console.warn(`Could not capture the complete training snapshot for '${handle}'; a later refresh will retry.`, error);
     }
   })();
 
@@ -249,7 +278,8 @@ function acknowledgeServerInstance(): void {
 }
 
 export async function restorePublicContext(
-  handle: string
+  handle: string,
+  mode: BackupMode = 'merge'
 ): Promise<{ restored: boolean; failed?: boolean; counts?: Record<string, number> }> {
   if (!isPublicMode) return { restored: false };
   const key = `${CONTEXT_PREFIX}${handle.trim().toLowerCase()}`;
@@ -274,7 +304,7 @@ export async function restorePublicContext(
         ...publicHeaders(handle),
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ context }),
+      body: JSON.stringify({ context, mode }),
     });
     if (!res.ok) return { restored: false, failed: true };
     const data = await res.json().catch(() => ({}));
@@ -337,12 +367,413 @@ export function getContextSavedAt(handle: string): string | null {
   }
 }
 
+export interface OfflineDashboardSnapshot {
+    savedAt: string;
+    data: DashboardOverview;
+    history: DailySet[];
+    journal: ProblemLearningEvent[];
+    dueReviews: ReviewQueueItem[];
+    reviewSummary: ReviewQueueSummary | null;
+    weeklyGoal: WeeklyGoal | null;
+  }
+
+  export function saveOfflineDashboard(snapshot: OfflineDashboardSnapshot): void {
+      const handle = snapshot.data.activeProfile?.handle?.trim().toLowerCase();
+      const key = handle ? `${OFFLINE_SNAPSHOT_KEY}:${handle}` : OFFLINE_SNAPSHOT_KEY;
+      writeStorage(key, JSON.stringify(snapshot));
+    }
+
+    export function readOfflineDashboard(handle = isPublicMode ? getPublicHandle() : null): OfflineDashboardSnapshot | null {
+      if (isPublicMode && !handle) return null;
+      const scopedKey = handle
+        ? `${OFFLINE_SNAPSHOT_KEY}:${handle.trim().toLowerCase()}`
+        : OFFLINE_SNAPSHOT_KEY;
+      const raw = readStorage(scopedKey) || (handle ? readStorage(OFFLINE_SNAPSHOT_KEY) : null);
+      if (!raw) return null;
+      try {
+        const snapshot: unknown = JSON.parse(raw);
+      if (
+        !snapshot ||
+        typeof snapshot !== 'object' ||
+        typeof (snapshot as OfflineDashboardSnapshot).savedAt !== 'string' ||
+        !(snapshot as OfflineDashboardSnapshot).data?.activeProfile ||
+        !Array.isArray((snapshot as OfflineDashboardSnapshot).history)
+      ) {
+        return null;
+      }
+      if (
+        handle &&
+        (snapshot as OfflineDashboardSnapshot).data.activeProfile.handle.toLowerCase() !== handle.trim().toLowerCase()
+      ) {
+        return null;
+      }
+      return snapshot as OfflineDashboardSnapshot;
+    } catch {
+      return null;
+    }
+  }
+
+  export async function exportBrowserData(): Promise<BrowserBackup> {
+    if (!isPublicMode) {
+      throw new Error('Browser data export is available in public browser-local mode only.');
+    }
+
+    const handles = Array.from(new Set(
+      [...getSavedHandles(), ...(currentHandle ? [currentHandle] : [])]
+        .map((handle) => handle.trim())
+        .filter((handle) => HANDLE_PATTERN.test(handle))
+    )).slice(0, 10);
+    if (handles.length === 0) throw new Error('There is no browser-local profile data to export yet.');
+
+    const profiles = [];
+    for (const handle of handles) {
+      const response = await globalThis.fetch(`${API_BASE}/context`, {
+        headers: publicHeaders(handle),
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw new Error(`Could not retrieve the complete server backup for '${handle}' (HTTP ${response.status}). Connect and retry; no partial backup was exported.`);
+      }
+      const context: unknown = await response.json();
+      if (
+        !context ||
+        typeof context !== 'object' ||
+        (context as Record<string, unknown>).version !== 1 ||
+        typeof (context as Record<string, unknown>).handle !== 'string' ||
+        String((context as Record<string, unknown>).handle).toLowerCase() !== handle.toLowerCase()
+      ) {
+        throw new Error(`The server returned an incomplete or invalid backup for '${handle}'.`);
+      }
+      profiles.push({
+        handle,
+        context: context as Record<string, unknown>,
+        knowledgeNotes: readKnowledgeNotes(handle),
+        virtualContests: listVirtualContestSessions(handle),
+      });
+    }
+
+    if (profiles.length === 0) {
+      throw new Error('No saved learning data was found. Connect to the service and try again.');
+    }
+    const backup = {
+      format: BROWSER_BACKUP_FORMAT,
+      version: BROWSER_BACKUP_VERSION,
+      exportedAt: new Date().toISOString(),
+      profiles,
+    };
+    const validated = validateBrowserBackup(backup);
+    if (new TextEncoder().encode(JSON.stringify(validated)).byteLength > MAX_BROWSER_BACKUP_BYTES) {
+      throw new Error('Complete backup exceeds the 10 MB safety limit. No partial export was created.');
+    }
+    return validated;
+  }
+
+  export async function importBrowserData(rawBackup: unknown, mode: BackupMode): Promise<void> {
+    if (!isPublicMode) {
+      throw new Error('Browser data restore is available in public browser-local mode only.');
+    }
+    if (mode !== 'merge' && mode !== 'replace') throw new Error('Import mode must be merge or replace.');
+    const backup = validateBrowserBackup(rawBackup);
+    const savedHandlesRaw = window.localStorage.getItem(HANDLES_KEY);
+    if (savedHandlesRaw) {
+      let existingHandles: unknown;
+      try {
+        existingHandles = JSON.parse(savedHandlesRaw);
+      } catch {
+        throw new Error('The saved browser profile list is malformed. Existing data was not changed.');
+      }
+      if (
+        !Array.isArray(existingHandles) ||
+        existingHandles.length > 10 ||
+        existingHandles.some((handle) => typeof handle !== 'string' || !HANDLE_PATTERN.test(handle.trim()))
+      ) {
+        throw new Error('The saved browser profile list is invalid. Existing data was not changed.');
+      }
+    }
+
+    const currentVirtualByHandle = new Map(
+      backup.profiles.map(({ handle }) => [handle.toLowerCase(), listVirtualContestSessions(handle)])
+    );
+    const affectedKeys = [
+      HANDLES_KEY,
+      ACTIVE_HANDLE_KEY,
+      ...backup.profiles.flatMap(({ handle, virtualContests }) => [
+        `${CONTEXT_PREFIX}${handle.toLowerCase()}`,
+        knowledgeNotesStorageKey(handle),
+        ...(currentVirtualByHandle.get(handle.toLowerCase()) || [])
+          .map((session) => virtualContestStorageKey(handle, session.contestId)),
+        ...virtualContests.map((session) => virtualContestStorageKey(handle, session.contestId)),
+      ]),
+    ];
+    const previousValues = snapshotBrowserStorage(window.localStorage, affectedKeys);
+
+    const handleMap = new Map<string, string>();
+    for (const handle of [...getSavedHandles(), ...backup.profiles.map(({ handle }) => handle)]) {
+      const canonicalHandle = handle.trim().toLowerCase();
+      if (HANDLE_PATTERN.test(handle.trim()) && !handleMap.has(canonicalHandle)) {
+        handleMap.set(canonicalHandle, handle.trim());
+      }
+    }
+    const newHandles = Array.from(handleMap.values());
+    if (newHandles.length > 10) {
+      throw new Error('This browser already has 10 profiles. Remove a saved profile before importing this backup.');
+    }
+
+    const prepared = backup.profiles.map((entry) => {
+      const { handle, context } = entry;
+      const key = `${CONTEXT_PREFIX}${handle.toLowerCase()}`;
+      const existingRaw = window.localStorage.getItem(key);
+      let existingContext: Record<string, unknown> | null = null;
+      let knowledgeNotes = entry.knowledgeNotes;
+      if (mode === 'merge' && existingRaw) {
+        let existing: unknown;
+        try {
+          existing = JSON.parse(existingRaw);
+        } catch {
+          throw new Error(`Saved browser data for '${handle}' is malformed. Existing data was not changed.`);
+        }
+        if (
+          !existing ||
+          typeof existing !== 'object' ||
+          (existing as Record<string, unknown>).version !== 1 ||
+          typeof (existing as Record<string, unknown>).handle !== 'string' ||
+          String((existing as Record<string, unknown>).handle).toLowerCase() !== handle.toLowerCase()
+        ) {
+          throw new Error(`Saved browser data for '${handle}' is invalid. Existing data was not changed.`);
+        }
+        validateBrowserBackup({
+          ...backup,
+          profiles: [{
+            handle,
+            context: existing as Record<string, unknown>,
+            knowledgeNotes: [],
+            virtualContests: [],
+          }],
+        });
+        existingContext = existing as Record<string, unknown>;
+      }
+      if (mode === 'merge') {
+        knowledgeNotes = mergeKnowledgeNotes(readKnowledgeNotes(handle), entry.knowledgeNotes);
+      }
+      const currentVirtual = currentVirtualByHandle.get(handle.toLowerCase()) || [];
+      const virtualContests = mode === 'merge'
+        ? Array.from(new Map([...currentVirtual, ...entry.virtualContests].map((session) => [session.contestId, session])).values())
+        : entry.virtualContests;
+      if (knowledgeNotes.length > 1000 || virtualContests.length > 1000) {
+        throw new Error(`Merged browser data for '${handle}' exceeds the supported backup limits.`);
+      }
+      return {
+        handle,
+        context,
+        serverContexts: serverContextImportSequence(context, existingContext, mode),
+        knowledgeNotes,
+        virtualContests,
+        currentVirtual,
+      };
+    });
+
+    validateBrowserBackup({
+      ...backup,
+      profiles: prepared.map(({ handle, context, knowledgeNotes, virtualContests }) => ({
+        handle,
+        context,
+        knowledgeNotes,
+        virtualContests,
+      })),
+    });
+
+    const requestBackup = {
+      ...backup,
+      profiles: prepared.map(({ handle, context, knowledgeNotes, virtualContests }) => ({
+        handle,
+        context,
+        knowledgeNotes,
+        virtualContests,
+      })),
+    };
+    if (new TextEncoder().encode(JSON.stringify(requestBackup)).byteLength > MAX_BROWSER_BACKUP_BYTES) {
+      throw new Error('Merged backup exceeds the 10 MB safety limit. No data was changed.');
+    }
+
+    const serverSnapshots = new Map<string, unknown>();
+    for (const { handle } of prepared) {
+      const response = await globalThis.fetch(`${API_BASE}/context`, {
+        headers: publicHeaders(handle),
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw new Error(`Could not verify existing server data for '${handle}'. No data was changed.`);
+      }
+      const snapshot: unknown = await response.json();
+      if (
+        !snapshot ||
+        typeof snapshot !== 'object' ||
+        (snapshot as Record<string, unknown>).version !== 1 ||
+        typeof (snapshot as Record<string, unknown>).handle !== 'string' ||
+        String((snapshot as Record<string, unknown>).handle).toLowerCase() !== handle.toLowerCase()
+      ) {
+        throw new Error(`Could not validate the current server data for '${handle}'. No data was changed.`);
+      }
+      serverSnapshots.set(handle, snapshot);
+    }
+
+    let localChangesApplied = false;
+    let storageRollbackFailures: string[] = [];
+    try {
+      for (const { handle, serverContexts } of prepared) {
+        for (const context of serverContexts) {
+          const response = await globalThis.fetch(`${API_BASE}/context`, {
+            method: 'POST',
+            headers: {
+              ...publicHeaders(handle),
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              context,
+              mode: mode === 'replace' ? 'replace' : 'merge',
+            }),
+          });
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error || `Could not restore data for '${handle}' (HTTP ${response.status}).`);
+          }
+        }
+      }
+
+      const canonicalContexts = new Map<string, Record<string, unknown>>();
+      for (const { handle } of prepared) {
+        const response = await globalThis.fetch(`${API_BASE}/context`, {
+          headers: publicHeaders(handle),
+          cache: 'no-store',
+        });
+        if (!response.ok) {
+          throw new Error(`Could not verify restored server data for '${handle}' (HTTP ${response.status}).`);
+        }
+        const context: unknown = await response.json();
+        if (
+          !context ||
+          typeof context !== 'object' ||
+          (context as Record<string, unknown>).version !== 1 ||
+          typeof (context as Record<string, unknown>).profileId !== 'string' ||
+          typeof (context as Record<string, unknown>).handle !== 'string' ||
+          String((context as Record<string, unknown>).handle).toLowerCase() !== handle.toLowerCase()
+        ) {
+          throw new Error(`Restored server data for '${handle}' has invalid profile identities.`);
+        }
+        canonicalContexts.set(handle, context as Record<string, unknown>);
+      }
+
+      validateBrowserBackup({
+        ...backup,
+        profiles: prepared.map(({ handle, knowledgeNotes, virtualContests }) => ({
+          handle,
+          context: canonicalContexts.get(handle) || {},
+          knowledgeNotes,
+          virtualContests,
+        })),
+      });
+
+      const localChanges = new Map<string, string | null>();
+      localChanges.set(HANDLES_KEY, JSON.stringify(newHandles));
+      for (const { handle, knowledgeNotes, virtualContests, currentVirtual } of prepared) {
+        localChanges.set(
+          `${CONTEXT_PREFIX}${handle.toLowerCase()}`,
+          JSON.stringify(canonicalContexts.get(handle))
+        );
+        localChanges.set(knowledgeNotesStorageKey(handle), JSON.stringify(knowledgeNotes));
+        if (mode === 'replace') {
+          for (const session of currentVirtual) {
+            if (!virtualContests.some((item) => item.contestId === session.contestId)) {
+              localChanges.set(virtualContestStorageKey(handle, session.contestId), null);
+            }
+          }
+        }
+        for (const session of virtualContests) {
+          localChanges.set(
+            virtualContestStorageKey(handle, session.contestId),
+            JSON.stringify(session)
+          );
+        }
+      }
+      applyBrowserStorageChanges(window.localStorage, localChanges, previousValues);
+      localChangesApplied = true;
+    } catch (error) {
+      if (error instanceof BrowserStorageTransactionError) {
+        storageRollbackFailures = error.rollbackFailures;
+      } else if (localChangesApplied) {
+        storageRollbackFailures = restoreBrowserStorageValues(window.localStorage, previousValues);
+      }
+
+      const rollbackFailures: string[] = [];
+      for (const { handle } of [...prepared].reverse()) {
+        try {
+          const response = await globalThis.fetch(`${API_BASE}/context`, {
+            method: 'POST',
+            headers: {
+              ...publicHeaders(handle),
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ context: serverSnapshots.get(handle), mode: 'replace' }),
+          });
+          if (!response.ok) rollbackFailures.push(handle);
+        } catch {
+          rollbackFailures.push(handle);
+        }
+      }
+
+      if (rollbackFailures.length > 0 || storageRollbackFailures.length > 0) {
+        const recoveryDownloaded = downloadImportRecoveryCopy(previousValues, serverSnapshots);
+        const details = [
+          storageRollbackFailures.length > 0
+            ? `browser storage rollback failed for ${storageRollbackFailures.join(', ')}`
+            : '',
+          rollbackFailures.length > 0
+            ? `server rollback could not be confirmed for ${rollbackFailures.join(', ')}`
+            : '',
+          recoveryDownloaded
+            ? 'an emergency recovery copy was downloaded'
+            : 'an emergency recovery copy could not be downloaded',
+        ].filter(Boolean).join('; ');
+        throw new Error(`Restore failed: ${error instanceof Error ? error.message : 'unknown error'}. ${details}.`);
+      }
+      throw new Error(
+        `Restore failed: ${error instanceof Error ? error.message : 'unknown error'}. Previous browser and server data were restored and verified.`
+      );
+    }
+  }
+
+  function downloadImportRecoveryCopy(
+    browserStorage: Map<string, string | null>,
+    serverProfiles: Map<string, unknown>
+  ): boolean {
+    try {
+      const payload = {
+        format: 'cp-coach-import-recovery',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        browserStorage: Array.from(browserStorage.entries(), ([key, value]) => ({ key, value })),
+        serverProfiles: Array.from(serverProfiles.entries(), ([handle, context]) => ({ handle, context })),
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `cp-coach-recovery-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return true;
+    } catch (error) {
+      console.error('Could not create emergency browser recovery download.', error);
+      return false;
+    }
+  }
+
 function scheduleContextCapture(): void {
   if (!isPublicMode || !currentHandle) return;
   if (captureTimer) clearTimeout(captureTimer);
   captureTimer = setTimeout(() => {
     captureTimer = null;
-    void capturePublicContext(currentHandle);
+    void capturePublicContext(currentHandle, { force: true });
   }, 400);
 }
 
@@ -353,7 +784,37 @@ function scheduleContextCapture(): void {
  * keep passing them without leaking another browser's data.
  */
 const apiFetch: typeof globalThis.fetch = (input, init) => {
-  if (!isPublicMode) return globalThis.fetch(input, init);
+  if (!isPublicMode) {
+    const startedAt = performance.now();
+    const method = (init?.method || 'GET').toUpperCase();
+    const url = typeof input === 'string'
+      ? input
+      : input instanceof Request
+        ? input.url
+        : input.toString();
+    return globalThis.fetch(input, init).then((response) => {
+      recordRequest({
+        method,
+        url,
+        startedAt,
+        durationMs: performance.now() - startedAt,
+        status: response.status,
+        serverTiming: response.headers.get('server-timing'),
+      });
+      return response;
+    }).catch((error: unknown) => {
+      recordRequest({
+        method,
+        url,
+        startedAt,
+        durationMs: performance.now() - startedAt,
+        status: 0,
+        serverTiming: null,
+        failed: true,
+      });
+      throw error;
+    });
+  }
 
   const headers = new Headers(init?.headers);
   headers.set('X-Coach-Client-Id', getOrCreateClientId());
@@ -391,13 +852,77 @@ const apiFetch: typeof globalThis.fetch = (input, init) => {
     }
   }
 
-  const promise = globalThis.fetch(nextInput, nextInit);
+  const url = typeof nextInput === 'string'
+    ? nextInput
+    : nextInput instanceof Request
+      ? nextInput.url
+      : nextInput.toString();
+  const isRead = method === 'GET' || method === 'HEAD';
+  const profilePath = new URL(`${API_BASE}/profiles`, window.location.origin).pathname;
+  const isProfileCreation = method === 'POST' && new URL(url, window.location.origin).pathname === profilePath;
+  const canRetryNetwork = isRead || isProfileCreation;
+  const requestKey = [
+    method,
+    url,
+    Array.from(headers.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}:${value}`).join('|'),
+    typeof nextInit.body === 'string' ? nextInit.body : '',
+  ].join('\n');
+
+  const existingRequest = inFlightPublicRequests.get(requestKey);
+  if (existingRequest) return existingRequest.then((response) => response.clone());
+
+  const promise = (async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      const attemptStartedAt = performance.now();
+      try {
+        const response = await globalThis.fetch(nextInput, nextInit);
+        recordRequest({
+          method,
+          url,
+          startedAt: attemptStartedAt,
+          durationMs: performance.now() - attemptStartedAt,
+          status: response.status,
+          serverTiming: response.headers.get('server-timing'),
+        });
+        if (isRead && [502, 503, 504].includes(response.status) && attempt < 2) {
+          await new Promise((resolve) => window.setTimeout(resolve, 700 * (attempt + 1)));
+          continue;
+        }
+        return response;
+      } catch (error) {
+        recordRequest({
+          method,
+          url,
+          startedAt: attemptStartedAt,
+          durationMs: performance.now() - attemptStartedAt,
+          status: 0,
+          serverTiming: null,
+          failed: true,
+        });
+        if (!canRetryNetwork || attempt >= 2) {
+          if (canRetryNetwork && error instanceof TypeError) {
+            throw new Error('The Coach service could not be reached. Check your connection and try again; your saved browser data has not been changed.');
+          }
+          throw error;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 700 * (attempt + 1)));
+      }
+    }
+  })();
+
+  if (isRead || isProfileCreation) {
+    inFlightPublicRequests.set(requestKey, promise);
+    void promise.finally(() => {
+      if (inFlightPublicRequests.get(requestKey) === promise) inFlightPublicRequests.delete(requestKey);
+    }).catch(() => {});
+  }
+
   if (method !== 'GET' && method !== 'HEAD') {
     promise.then((response) => {
       if (response.ok) scheduleContextCapture();
     }).catch(() => {});
   }
-  return promise;
+  return promise.then((response) => response.clone());
 };
 
 const fetch = apiFetch;
@@ -406,8 +931,10 @@ export async function fetchProfiles(): Promise<{ profiles: UserProfile[]; active
   if (isPublicMode) {
     const handles = getSavedHandles();
     const query = handles.length > 0 ? `?handles=${encodeURIComponent(handles.join(','))}` : '';
-    const res = await globalThis.fetch(`${API_BASE}/profiles${query}`, { headers: publicHeaders() });
-    if (!res.ok) throw new Error('Failed to fetch browser profiles');
+    const res = await fetch(`${API_BASE}/profiles${query}`, { headers: publicHeaders() });
+    if (!res.ok) {
+      throw new Error('Could not load saved browser profiles. The Coach service may be waking up; please retry in a moment.');
+    }
     const data = await res.json() as { profiles: UserProfile[]; activeProfileId: string };
     rememberProfiles(data.profiles || []);
     if (!getPublicHandle() && data.profiles?.[0]) {
@@ -597,6 +1124,19 @@ export async function fetchContests(profileId?: string): Promise<any[]> {
   return res.json();
 }
 
+export async function fetchUpcomingContests(): Promise<Array<{
+  id: number;
+  name: string;
+  startTimeSeconds: number;
+  durationSeconds: number;
+  phase: string;
+  url: string;
+}>> {
+  const res = await fetch(`${API_BASE}/contests/upcoming`);
+  if (!res.ok) throw new Error('Failed to fetch upcoming contests');
+  return res.json();
+}
+
 export async function syncContests(profileId?: string): Promise<{ success: boolean; count: number; contests: any[] }> {
   const res = await fetch(`${API_BASE}/contests/sync`, {
     method: 'POST',
@@ -691,6 +1231,18 @@ export async function fetchSkillTracks(profileId?: string, date?: string): Promi
 
   const res = await fetch(url);
   if (!res.ok) throw new Error('Failed to fetch skill tracks');
+  return res.json();
+}
+
+export async function fetchWeeklyReport(profileId?: string): Promise<WeeklyCoachReport> {
+  const url = profileId
+    ? `${API_BASE}/weekly-report?profileId=${encodeURIComponent(profileId)}`
+    : `${API_BASE}/weekly-report`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}));
+    throw new Error(error.message || error.error || 'Failed to load weekly coach report');
+  }
   return res.json();
 }
 
@@ -882,4 +1434,83 @@ export async function fetchHealth(): Promise<{ status: string; timestamp: string
   const res = await fetch(`${API_BASE}/health`);
   if (!res.ok) throw new Error('Health check failed');
   return res.json();
+}
+
+export interface NotificationSettings {
+  contestReminders: boolean;
+  dailyReminders: boolean;
+  reminderTime: string;
+  timezone: string;
+}
+
+export interface NotificationAvailability {
+  available: boolean;
+  vapidPublicKey: string | null;
+  timezone: string;
+}
+
+export async function fetchNotificationAvailability(): Promise<NotificationAvailability> {
+  const res = await fetch(`${API_BASE}/notifications/config`);
+  if (!res.ok) throw new Error('Could not load push notification configuration');
+  return res.json();
+}
+
+export async function fetchNotificationSettings(): Promise<{
+  available: boolean;
+  settings: NotificationSettings;
+}> {
+  const res = await fetch(`${API_BASE}/notifications/settings`);
+  if (!res.ok) throw new Error('Could not load notification settings');
+  return res.json();
+}
+
+export async function isPushSubscriptionRegistered(endpoint: string): Promise<boolean> {
+  const params = new URLSearchParams({ endpoint });
+  const res = await fetch(`${API_BASE}/notifications/subscriptions/status?${params}`);
+  if (!res.ok) throw new Error('Could not verify this device subscription');
+  const result = await res.json();
+  return result.registered === true;
+}
+
+export async function saveNotificationSettings(
+  settings: Pick<NotificationSettings, 'contestReminders' | 'dailyReminders' | 'reminderTime'>
+): Promise<NotificationSettings> {
+  const res = await fetch(`${API_BASE}/notifications/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}));
+    throw new Error(error.error || error.message || 'Could not save notification settings');
+  }
+  const result = await res.json();
+  return result.settings;
+}
+
+export async function registerPushSubscription(subscription: {
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+}): Promise<void> {
+  const res = await fetch(`${API_BASE}/notifications/subscriptions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ subscription }),
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}));
+    throw new Error(error.error || 'Could not register this device for notifications');
+  }
+}
+
+export async function removePushSubscription(endpoint: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/notifications/subscriptions`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ endpoint }),
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}));
+    throw new Error(error.error || 'Could not remove this device subscription');
+  }
 }

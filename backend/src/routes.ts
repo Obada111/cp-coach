@@ -22,9 +22,81 @@ import { tutorialService } from './tutorialService.js';
 import { reviewService } from './reviewService.js';
 import { solveSessionService } from './solveSessionService.js';
 import { problemJournalService } from './problemJournalService.js';
+import { exportPublicContext, importPublicContext } from './publicContextService.js';
+import { weeklyReportService } from './weeklyReportService.js';
+import { notificationsService } from './notificationsService.js';
 import { DashboardOverview } from './types.js';
+import { PerfTrace, attachServerTiming } from './perf.js';
 
 export const apiRouter = Router();
+
+const DASHBOARD_REFRESH_COOLDOWN_MS = 60_000;
+const lastDashboardRefreshStartedAt = new Map<string, number>();
+
+const SOLVED_STATUSES = new Set([
+  'SOLVED_INDEPENDENTLY',
+  'SOLVED_WITH_HINTS',
+  'VIEWED_EDITORIAL',
+  'NOT_SOLVED',
+]);
+const PERCEIVED_DIFFICULTIES = new Set(['EASY', 'NORMAL', 'HARD']);
+const DIFFICULTY_EXPERIENCES = new Set([
+  'MUCH_EASIER',
+  'SLIGHTLY_EASY',
+  'APPROPRIATE',
+  'CHALLENGING',
+  'MUCH_HARDER',
+]);
+const SOLUTION_METHODS = new Set([
+  'INDEPENDENT',
+  'HINTS',
+  'EDITORIAL',
+  'IDEA_IMPLEMENTATION',
+  'NOT_SOLVED',
+]);
+const STRUGGLE_REASONS = new Set([
+  'KEY_OBSERVATION',
+  'ALGORITHM_CHOICE',
+  'PROOF',
+  'IMPLEMENTATION',
+  'DEBUGGING',
+  'EDGE_CASES',
+]);
+const PROBLEM_OPINIONS = new Set([
+  'USEFUL_RELEVANT',
+  'INTERESTING_TOO_EASY',
+  'TOO_DIFFICULT',
+  'REPETITIVE_FAMILIAR',
+  'POOR_FIT',
+]);
+const REVIEW_OUTCOMES = new Set(['MASTERED', 'EASY', 'DIFFICULT', 'DEFERRED']);
+const REVIEW_SOURCES = new Set(['DAILY_STRUGGLE', 'CONTEST_STRUGGLE', 'MANUAL']);
+const SESSION_OUTCOMES = new Set([
+  'SOLVED_INDEPENDENTLY',
+  'SOLVED_WITH_HINTS',
+  'SOLVED_WITH_EDITORIAL',
+  'UNSOLVED',
+  'ABANDONED',
+]);
+
+function optionalAllowed(value: unknown, allowed: Set<string>): boolean {
+  return value === undefined || value === null || value === '' || (typeof value === 'string' && allowed.has(value));
+}
+
+function optionalText(value: unknown, maxLength: number): string | null {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string') throw new Error('Text fields must be strings');
+  return value.slice(0, maxLength);
+}
+
+function optionalMinutes(value: unknown): number | null {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 24 * 60) {
+    throw new Error('timeSpentMinutes must be an integer between 0 and 1440');
+  }
+  return parsed;
+}
 
 // ==========================================
 // 1. Profiles API (Multi-Profile Support)
@@ -137,7 +209,11 @@ apiRouter.delete('/profiles/:id', (req, res) => {
 // 2. Dashboard Overview (Scoped by Profile)
 // ==========================================
 apiRouter.get('/dashboard', async (req, res) => {
+  const trace = new PerfTrace('GET /dashboard', {
+    profileId: typeof req.query.profileId === 'string' ? req.query.profileId : undefined,
+  });
   try {
+    trace.start('dashboard.profile');
     const profileIdQuery = req.query.profileId as string | undefined;
     const activeId = profileIdQuery || getActiveProfileId();
     let activeProfile = getProfileById(activeId);
@@ -157,31 +233,91 @@ apiRouter.get('/dashboard', async (req, res) => {
       ? getProfilesForOwner(publicClientId)
       : getAllProfiles();
     const handle = activeProfile.handle;
+    trace.end('dashboard.profile');
 
     // Track active session for background scheduler
     try {
       db.prepare("UPDATE profiles SET last_active_at = datetime('now') WHERE id = ?").run(activeProfile.id);
     } catch {}
 
-    // Auto-refresh stale Codeforces data on page load (submissions & profile refreshed if > 5m old)
-    const syncStatus = await codeforcesCacheService.autoRefreshIfNeeded(activeProfile.id, false);
+    trace.start('dashboard.freshness');
+    const cachedStatus = codeforcesCacheService.getFreshnessStatus(handle, activeProfile.id);
+    trace.end('dashboard.freshness');
+
+    // Never make the dashboard wait for Codeforces. Serve the last valid
+    // snapshot immediately and refresh stale data in the background.
+    const lastRefreshStartedAt = lastDashboardRefreshStartedAt.get(activeProfile.id) || 0;
+    const shouldStartRefresh = !cachedStatus.isSyncing &&
+      Date.now() - lastRefreshStartedAt >= DASHBOARD_REFRESH_COOLDOWN_MS && (
+        cachedStatus.submissionsCount === 0 ||
+        cachedStatus.dataFreshness.isAnyStale
+      );
+    if (shouldStartRefresh) {
+      if (lastDashboardRefreshStartedAt.size > 1000) {
+        const cutoff = Date.now() - DASHBOARD_REFRESH_COOLDOWN_MS * 2;
+        for (const [profileId, startedAt] of lastDashboardRefreshStartedAt) {
+          if (startedAt < cutoff) lastDashboardRefreshStartedAt.delete(profileId);
+        }
+      }
+      lastDashboardRefreshStartedAt.set(activeProfile.id, Date.now());
+      const syncTrace = new PerfTrace('background-sync', { profileId: activeProfile.id, handle });
+      void codeforcesCacheService
+        .autoRefreshIfNeeded(activeProfile.id, false, syncTrace)
+        .then(() => syncTrace.log({ status: 'complete' }))
+        .catch((error: unknown) => {
+          syncTrace.log({ status: 'failed' });
+          console.warn('[Dashboard] Background Codeforces refresh failed:', error);
+        });
+    }
+
+    trace.start('dashboard.cachedData');
     const user = codeforcesService.getCachedProfile(handle);
     const ratingHistory = codeforcesService.getCachedRatingHistory(handle);
     const userRating = user?.rating || activeProfile.rating || 1300;
+    trace.end('dashboard.cachedData');
 
-    // Analyze topics isolated for this profile
+    trace.start('dashboard.topics');
     const allTopics = analysisService.analyzeTopics(handle, userRating, activeProfile.id);
     const weak = allTopics.filter((t) => t.status === 'WEAK');
     const strong = allTopics.filter((t) => t.status === 'STRONG');
     const unexplored = allTopics.filter((t) => t.status === 'UNEXPLORED');
+    trace.end('dashboard.topics');
 
-    // Ensure problem statuses (verified AC / attempted) are updated with latest submissions
-    syncProfileProblemStatuses(activeProfile.id, handle);
+    // Generating a new recommendation while submissions or the candidate pool
+    // are stale could surface a problem the learner has already solved. Keep
+    // the existing set (restored from the browser) and wait for the background
+    // refresh before creating a new one.
+    let todaySet: DashboardOverview['todaySet'] = null;
+    const date = recommendationService.getTodayDateString();
+    const existingSet = db.prepare(
+      'SELECT 1 AS present FROM daily_sets WHERE profile_id = ? AND date = ?'
+    ).get(activeProfile.id, date);
+    const canGenerateDailySet = Boolean(existingSet) || (
+      !cachedStatus.isSyncing &&
+      cachedStatus.submissionsCount > 0 &&
+      cachedStatus.problemsCount >= 100 &&
+      !cachedStatus.dataFreshness.isSubmissionsStale &&
+      !cachedStatus.dataFreshness.isProblemsetStale
+    );
+    if (canGenerateDailySet) {
+      trace.start('dashboard.dailySet');
+      try {
+        todaySet = recommendationService.getOrGenerateDailySet(activeProfile.id);
+      } catch (dailyError) {
+        console.warn('[Dashboard] Daily set is not available yet:', dailyError);
+      }
+      trace.end('dashboard.dailySet');
+    }
 
-    // Get today's daily problem set isolated for this profile
-    const todaySet = recommendationService.getOrGenerateDailySet(activeProfile.id);
+    trace.start('dashboard.learnerModel');
     const streakDays = recommendationService.calculateStreak(activeProfile.id);
     const learnerModel = analysisService.getOrComputeLearnerModel(activeProfile.id, handle, userRating);
+    trace.end('dashboard.learnerModel');
+
+    const syncStatus = {
+      ...cachedStatus,
+      isSyncing: cachedStatus.isSyncing || shouldStartRefresh,
+    };
 
     const overview: DashboardOverview = {
       activeProfile,
@@ -201,8 +337,15 @@ apiRouter.get('/dashboard', async (req, res) => {
       learnerModel,
     };
 
+    trace.log({
+      todaySetReady: Boolean(todaySet),
+      refreshScheduled: shouldStartRefresh,
+      cachedIsStale: cachedStatus.dataFreshness.isAnyStale,
+    });
+    attachServerTiming(trace, res);
     res.json(overview);
   } catch (err: any) {
+    trace.log({ status: 'failed', error: err?.message });
     console.error('Error generating dashboard data:', err);
     res.status(500).json({ error: 'Internal server error', message: err.message });
   }
@@ -264,14 +407,41 @@ apiRouter.post('/problems/:id/feedback', (req, res) => {
     if (!solvedStatus) {
       return res.status(400).json({ error: 'solvedStatus is required' });
     }
+    if (!SOLVED_STATUSES.has(solvedStatus)) {
+      return res.status(400).json({ error: 'Invalid solvedStatus' });
+    }
+    if (!optionalAllowed(perceivedDifficulty, PERCEIVED_DIFFICULTIES)) {
+      return res.status(400).json({ error: 'Invalid perceivedDifficulty' });
+    }
+    if (!optionalAllowed(difficultyExperience, DIFFICULTY_EXPERIENCES)) {
+      return res.status(400).json({ error: 'Invalid difficultyExperience' });
+    }
+    if (!optionalAllowed(solutionMethod, SOLUTION_METHODS)) {
+      return res.status(400).json({ error: 'Invalid solutionMethod' });
+    }
+    if (!optionalAllowed(struggleReason, STRUGGLE_REASONS)) {
+      return res.status(400).json({ error: 'Invalid struggleReason' });
+    }
+    if (!optionalAllowed(problemOpinion, PROBLEM_OPINIONS)) {
+      return res.status(400).json({ error: 'Invalid problemOpinion' });
+    }
+
+    let parsedTimeSpent: number | null;
+    let cleanNotes: string | null;
+    try {
+      parsedTimeSpent = optionalMinutes(timeSpentMinutes);
+      cleanNotes = optionalText(notes, 5000);
+    } catch (validationError: any) {
+      return res.status(400).json({ error: validationError.message });
+    }
 
     const updated = recommendationService.saveFeedback(problemId, {
       solvedStatus,
-      perceivedDifficulty,
-      difficultyExperience,
-      solutionMethod,
-      timeSpentMinutes: timeSpentMinutes ? parseInt(timeSpentMinutes, 10) : null,
-      notes: notes || null,
+      perceivedDifficulty: perceivedDifficulty || null,
+      difficultyExperience: difficultyExperience || null,
+      solutionMethod: solutionMethod || null,
+      timeSpentMinutes: parsedTimeSpent,
+      notes: cleanNotes,
       struggleReason: struggleReason || null,
       problemOpinion: problemOpinion || null,
     });
@@ -352,6 +522,33 @@ apiRouter.get('/journal', (req, res) => {
     res.json(problemJournalService.getForProfile(profileId, limit));
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to retrieve problem learning journal', message: err.message });
+  }
+});
+
+// Versioned browser/local backup. The public API exposes the same underlying
+// snapshot through /api/public/context; this route supports local mode.
+apiRouter.get('/context', (req, res) => {
+  try {
+    const profileId = (req.query.profileId as string) || getActiveProfileId();
+    if (!getProfileById(profileId)) return res.status(404).json({ error: 'Profile not found' });
+    res.json(exportPublicContext(profileId));
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to export backup', message: err.message });
+  }
+});
+
+apiRouter.post('/context', (req, res) => {
+  try {
+    const profileId = req.body.profileId || (req.query.profileId as string) || getActiveProfileId();
+    if (!getProfileById(profileId)) return res.status(404).json({ error: 'Profile not found' });
+    const mode = req.body?.mode;
+    if (mode !== undefined && mode !== 'merge' && mode !== 'replace') {
+      return res.status(400).json({ error: 'Import mode must be merge or replace' });
+    }
+    const context = req.body?.context ?? req.body;
+    res.json(importPublicContext(profileId, context, { mode: mode || 'merge' }));
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Failed to restore backup' });
   }
 });
 
@@ -456,6 +653,34 @@ apiRouter.post('/contests/sync', async (req, res) => {
   }
 });
 
+apiRouter.get('/contests/upcoming', async (_req, res) => {
+  try {
+    const contests = await codeforcesService.getOfficialContests();
+    if (!Array.isArray(contests)) {
+      return res.json([]);
+    }
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const upcoming = contests
+      .filter((contest) => contest && typeof contest.id === 'number' && contest.id > 0 && contest.startTimeSeconds > nowSeconds)
+      .sort((a, b) => Number(a.startTimeSeconds) - Number(b.startTimeSeconds))
+      .slice(0, 6)
+      .map((contest) => ({
+        id: contest.id,
+        name: contest.name,
+        startTimeSeconds: contest.startTimeSeconds,
+        durationSeconds: contest.durationSeconds || 7200,
+        phase: contest.phase || 'BEFORE',
+        url: `https://codeforces.com/contest/${contest.id}`,
+      }));
+
+    res.json(upcoming);
+  } catch (err: any) {
+    console.error('Error fetching upcoming contests:', err);
+    res.status(500).json({ error: 'Failed to fetch upcoming contest list', message: err.message });
+  }
+});
+
 // Manually import a contest by ID or URL
 apiRouter.post('/contests/import', async (req, res) => {
   try {
@@ -542,6 +767,22 @@ apiRouter.get('/skill-tracks', (req, res) => {
   } catch (err: any) {
     console.error('Error computing skill tracks:', err);
     res.status(500).json({ error: 'Failed to compute skill tracks', message: err.message });
+  }
+});
+
+apiRouter.get('/weekly-report', (req, res) => {
+  try {
+    const profileId = (req.query.profileId as string) || getActiveProfileId();
+    const profile = getProfileById(profileId);
+    if (!profile) return res.status(404).json({ error: 'Profile not found' });
+    const date = typeof req.query.date === 'string' ? req.query.date : undefined;
+    if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(`${date}T00:00:00.000Z`)))) {
+      return res.status(400).json({ error: 'Date must use YYYY-MM-DD format' });
+    }
+    res.json(weeklyReportService.getReport(profileId, date));
+  } catch (err: any) {
+    console.error('Error generating weekly coach report:', err);
+    res.status(500).json({ error: 'Failed to generate weekly report', message: err.message });
   }
 });
 
@@ -730,9 +971,20 @@ apiRouter.post('/reviews/enqueue', (req, res) => {
   try {
     const profileId = req.body.profileId || (req.query.profileId as string) || getActiveProfileId();
     const { problemId, triggerReason, source } = req.body;
-    if (!problemId) return res.status(400).json({ error: 'problemId is required' });
+    if (!problemId || typeof problemId !== 'string') {
+      return res.status(400).json({ error: 'problemId is required' });
+    }
+    if (source !== undefined && !REVIEW_SOURCES.has(source)) {
+      return res.status(400).json({ error: 'Invalid review source' });
+    }
+    let cleanReason = 'Manual review request';
+    try {
+      cleanReason = optionalText(triggerReason, 500) || cleanReason;
+    } catch (validationError: any) {
+      return res.status(400).json({ error: validationError.message });
+    }
 
-    const item = reviewService.enqueueProblem(profileId, problemId, triggerReason || 'Manual review request', source || 'MANUAL');
+    const item = reviewService.enqueueProblem(profileId, problemId, cleanReason, source || 'MANUAL');
     res.json({ success: true, reviewItem: item });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to enqueue review item', message: err.message });
@@ -745,8 +997,17 @@ apiRouter.post('/reviews/:problemId/action', (req, res) => {
     const problemId = req.params.problemId;
     const { outcome, notes } = req.body;
     if (!outcome) return res.status(400).json({ error: 'outcome is required (MASTERED, EASY, DIFFICULT, DEFERRED)' });
+    if (!REVIEW_OUTCOMES.has(outcome)) {
+      return res.status(400).json({ error: 'Invalid review outcome' });
+    }
+    let cleanNotes: string | null;
+    try {
+      cleanNotes = optionalText(notes, 5000);
+    } catch (validationError: any) {
+      return res.status(400).json({ error: validationError.message });
+    }
 
-    const item = reviewService.recordReviewOutcome(profileId, problemId, outcome, notes);
+    const item = reviewService.recordReviewOutcome(profileId, problemId, outcome, cleanNotes || undefined);
     res.json({ success: true, reviewItem: item });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to record review outcome', message: err.message });
@@ -781,7 +1042,9 @@ apiRouter.post('/sessions/start', (req, res) => {
   try {
     const profileId = req.body.profileId || (req.query.profileId as string) || getActiveProfileId();
     const { problemId } = req.body;
-    if (!problemId) return res.status(400).json({ error: 'problemId is required' });
+    if (!problemId || typeof problemId !== 'string') {
+      return res.status(400).json({ error: 'problemId is required' });
+    }
 
     const session = solveSessionService.startSession(profileId, problemId);
     res.json({ success: true, session });
@@ -812,7 +1075,39 @@ apiRouter.post('/sessions/:id/editorial', (req, res) => {
 
 apiRouter.post('/sessions/:id/finish', (req, res) => {
   try {
-    const session = solveSessionService.finishSession(req.params.id, req.body);
+    const payload = req.body || {};
+    if (payload.outcome !== undefined && !SESSION_OUTCOMES.has(payload.outcome)) {
+      return res.status(400).json({ error: 'Invalid session outcome' });
+    }
+    if (!optionalAllowed(payload.perceivedDifficulty, PERCEIVED_DIFFICULTIES)) {
+      return res.status(400).json({ error: 'Invalid perceivedDifficulty' });
+    }
+    if (!optionalAllowed(payload.struggleType, STRUGGLE_REASONS)) {
+      return res.status(400).json({ error: 'Invalid struggleType' });
+    }
+    if (payload.activeDurationSeconds !== undefined) {
+      const seconds = Number(payload.activeDurationSeconds);
+      if (!Number.isInteger(seconds) || seconds < 0 || seconds > 24 * 60 * 60) {
+        return res.status(400).json({ error: 'Invalid activeDurationSeconds' });
+      }
+    }
+    let keyTakeaway: string | null;
+    let reflectionNotes: string | null;
+    try {
+      keyTakeaway = optionalText(payload.keyTakeaway, 3000);
+      reflectionNotes = optionalText(payload.reflectionNotes, 5000);
+    } catch (validationError: any) {
+      return res.status(400).json({ error: validationError.message });
+    }
+
+    const session = solveSessionService.finishSession(req.params.id, {
+      ...payload,
+      outcome: payload.outcome,
+      perceivedDifficulty: payload.perceivedDifficulty || undefined,
+      struggleType: payload.struggleType || undefined,
+      keyTakeaway: keyTakeaway || undefined,
+      reflectionNotes: reflectionNotes || undefined,
+    });
     res.json({ success: true, session });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to finish session', message: err.message });
@@ -829,3 +1124,83 @@ apiRouter.get('/sessions/analytics', (req, res) => {
   }
 });
 
+apiRouter.get('/notifications/config', (_req, res) => {
+  res.json(notificationsService.getPublicConfig());
+});
+
+apiRouter.get('/notifications/subscriptions/status', (req, res) => {
+  const profileId = (req.query.profileId as string) || getActiveProfileId();
+  if (!getProfileById(profileId)) return res.status(404).json({ error: 'Profile not found' });
+  res.json({
+    registered: notificationsService.hasSubscription(profileId, profileId, req.query.endpoint),
+  });
+});
+
+apiRouter.get('/notifications/settings', (req, res) => {
+  try {
+    const profileId = (req.query.profileId as string) || getActiveProfileId();
+    if (!getProfileById(profileId)) return res.status(404).json({ error: 'Profile not found' });
+    res.json({
+      available: notificationsService.isAvailable(),
+      settings: notificationsService.getSettings(profileId),
+    });
+  } catch (err) {
+    console.error('Failed to load notification settings:', err);
+    res.status(500).json({ error: 'Could not load notification settings' });
+  }
+});
+
+apiRouter.put('/notifications/settings', (req, res) => {
+  try {
+    const profileId = (req.body?.profileId as string) || (req.query.profileId as string) || getActiveProfileId();
+    if (!getProfileById(profileId)) return res.status(404).json({ error: 'Profile not found' });
+    const settings = notificationsService.updateSettings(profileId, {
+      contestReminders: req.body?.contestReminders,
+      dailyReminders: req.body?.dailyReminders,
+      reminderTime: req.body?.reminderTime,
+    });
+    res.json({ success: true, settings });
+  } catch (err: any) {
+    const expected = new Set([
+      'Reminder time must use 24-hour HH:mm format',
+      'Reminder settings must be boolean values',
+    ]);
+    if (expected.has(err?.message)) return res.status(400).json({ error: err.message });
+    console.error('Failed to update notification settings:', err);
+    res.status(500).json({ error: 'Could not update notification settings' });
+  }
+});
+
+apiRouter.post('/notifications/subscriptions', (req, res) => {
+  if (!notificationsService.isAvailable()) {
+    return res.status(503).json({ error: 'Push notifications are not configured for this deployment' });
+  }
+  try {
+    const profileId = (req.body?.profileId as string) || (req.query.profileId as string) || getActiveProfileId();
+    if (!getProfileById(profileId)) return res.status(404).json({ error: 'Profile not found' });
+    notificationsService.registerSubscription(profileId, profileId, req.body?.subscription);
+    res.status(201).json({ success: true });
+  } catch (err: any) {
+    if (
+      err?.message === 'A valid HTTPS push subscription is required' ||
+      err?.message === 'This device is already registered to another profile'
+    ) {
+      return res.status(err.message.startsWith('This device') ? 409 : 400).json({ error: err.message });
+    }
+    console.error('Failed to register push subscription:', err);
+    res.status(500).json({ error: 'Could not register this device for push notifications' });
+  }
+});
+
+apiRouter.delete('/notifications/subscriptions', (req, res) => {
+  try {
+    const profileId = (req.body?.profileId as string) || (req.query.profileId as string) || getActiveProfileId();
+    if (!getProfileById(profileId)) return res.status(404).json({ error: 'Profile not found' });
+    notificationsService.removeSubscription(profileId, profileId, req.body?.endpoint);
+    res.json({ success: true });
+  } catch (err: any) {
+    if (err?.message === 'A valid push endpoint is required') return res.status(400).json({ error: err.message });
+    console.error('Failed to remove push subscription:', err);
+    res.status(500).json({ error: 'Could not remove this device subscription' });
+  }
+});

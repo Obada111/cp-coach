@@ -2,6 +2,7 @@ import { db, getProfileById, getProfileByHandle, getCurriculumProblem } from './
 import { analysisService } from './analysisService.js';
 import { tutorialService } from './tutorialService.js';
 import { problemJournalService } from './problemJournalService.js';
+import { reviewService } from './reviewService.js';
 import { 
   DailySet, 
   DailyProblem, 
@@ -802,51 +803,77 @@ export class RecommendationService {
     const isSelfReported = (payload.solvedStatus === 'SOLVED_INDEPENDENTLY' || payload.solvedStatus === 'SOLVED_WITH_HINTS' || payload.solvedStatus === 'VIEWED_EDITORIAL') ? 1 : 0;
     const completed = (isVerifiedAc === 1 || isSelfReported === 1) ? 1 : 0;
 
-    db.prepare(`
-      UPDATE daily_problems
-      SET 
-        completed = ?,
-        self_reported_solved = ?,
-        solved_status = ?,
-        perceived_difficulty = ?,
-        difficulty_experience = ?,
-        solution_method = ?,
-        time_spent_minutes = ?,
-        notes = ?,
-        struggle_reason = ?,
-        problem_opinion = ?,
-        verified_cf_ac = ?,
-        updated_at = datetime('now')
-      WHERE id = ?
-    `).run(
-      completed,
-      isSelfReported,
-      payload.solvedStatus,
-      payload.perceivedDifficulty ?? null,
-      payload.difficultyExperience ?? null,
-      payload.solutionMethod ?? null,
-      payload.timeSpentMinutes ?? null,
-      payload.notes ?? null,
-      payload.struggleReason ?? null,
-      payload.problemOpinion ?? null,
-      isVerifiedAc,
-      dailyProblemId
-    );
+    db.exec('BEGIN TRANSACTION');
+    try {
+      db.prepare(`
+        UPDATE daily_problems
+        SET
+          completed = ?,
+          self_reported_solved = ?,
+          solved_status = ?,
+          perceived_difficulty = ?,
+          difficulty_experience = ?,
+          solution_method = ?,
+          time_spent_minutes = ?,
+          notes = ?,
+          struggle_reason = ?,
+          problem_opinion = ?,
+          verified_cf_ac = ?,
+          updated_at = datetime('now')
+        WHERE id = ?
+      `).run(
+        completed,
+        isSelfReported,
+        payload.solvedStatus,
+        payload.perceivedDifficulty ?? null,
+        payload.difficultyExperience ?? null,
+        payload.solutionMethod ?? null,
+        payload.timeSpentMinutes ?? null,
+        payload.notes ?? null,
+        payload.struggleReason ?? null,
+        payload.problemOpinion ?? null,
+        isVerifiedAc,
+        dailyProblemId
+      );
 
-    if (existing) {
-      problemJournalService.record({
-        profileId: existing.profile_id,
-        problemId: existing.problem_id,
-        source: 'DAILY_FEEDBACK',
-        solvedStatus: payload.solvedStatus,
-        perceivedDifficulty: payload.perceivedDifficulty ?? null,
-        difficultyExperience: payload.difficultyExperience ?? null,
-        solutionMethod: payload.solutionMethod ?? null,
-        struggleReason: payload.struggleReason ?? null,
-        notes: payload.notes ?? null,
-        problemOpinion: payload.problemOpinion ?? null,
-        verifiedAc: isVerifiedAc === 1,
-      });
+      if (existing) {
+        problemJournalService.record({
+          profileId: existing.profile_id,
+          problemId: existing.problem_id,
+          source: 'DAILY_FEEDBACK',
+          solvedStatus: payload.solvedStatus,
+          perceivedDifficulty: payload.perceivedDifficulty ?? null,
+          difficultyExperience: payload.difficultyExperience ?? null,
+          solutionMethod: payload.solutionMethod ?? null,
+          struggleReason: payload.struggleReason ?? null,
+          notes: payload.notes ?? null,
+          problemOpinion: payload.problemOpinion ?? null,
+          verifiedAc: isVerifiedAc === 1,
+        });
+
+        const struggleSignals = [
+          payload.solvedStatus !== 'SOLVED_INDEPENDENTLY' ? payload.solvedStatus : null,
+          payload.solutionMethod && payload.solutionMethod !== 'INDEPENDENT' ? payload.solutionMethod : null,
+          payload.perceivedDifficulty === 'HARD' ? 'HARD_DIFFICULTY' : null,
+          payload.difficultyExperience === 'CHALLENGING' || payload.difficultyExperience === 'MUCH_HARDER'
+            ? payload.difficultyExperience
+            : null,
+          payload.struggleReason,
+          payload.problemOpinion === 'TOO_DIFFICULT' ? payload.problemOpinion : null,
+        ].filter((signal): signal is string => Boolean(signal));
+        if (struggleSignals.length > 0) {
+          reviewService.enqueueProblem(
+            existing.profile_id,
+            existing.problem_id,
+            `Daily feedback: ${struggleSignals.join(', ')}`,
+            'DAILY_STRUGGLE'
+          );
+        }
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch {}
+      throw error;
     }
 
     // Immediately update learner model to reflect this feedback

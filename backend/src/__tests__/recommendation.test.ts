@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { db, initDatabase, createProfile, getProfileByHandle } from '../db.js';
 import { recommendationService } from '../recommendationService.js';
 import { analysisService } from '../analysisService.js';
+import { reviewService } from '../reviewService.js';
 
 describe('Adaptive Recommendation Engine & Multi-Profile Logic', () => {
   const handleA = 'Obadajo';
@@ -13,6 +14,7 @@ describe('Adaptive Recommendation Engine & Multi-Profile Logic', () => {
     initDatabase();
     db.prepare('DELETE FROM sync_leases').run();
     db.prepare('DELETE FROM daily_problems').run();
+    db.prepare('DELETE FROM review_queue').run();
     db.prepare('DELETE FROM daily_sets').run();
     db.prepare('DELETE FROM submissions').run();
     db.prepare('DELETE FROM profile_cache').run();
@@ -300,5 +302,80 @@ describe('Adaptive Recommendation Engine & Multi-Profile Logic', () => {
     );
 
     expect(candidate?.problemId).toBe('3000_A');
+  });
+
+  it('schedules struggling feedback for review with the specific reason and short interval', () => {
+    const dailySet = recommendationService.getOrGenerateDailySet(profileAId, '2026-10-12');
+    const problem = dailySet.problems[0];
+    recommendationService.saveFeedback(problem.id, {
+      solvedStatus: 'SOLVED_WITH_HINTS',
+      solutionMethod: 'HINTS',
+      perceivedDifficulty: 'HARD',
+      struggleReason: 'ALGORITHM_CHOICE',
+    });
+
+    const review = reviewService.getReviewItem(profileAId, problem.problemId);
+    expect(review).not.toBeNull();
+    expect(review?.intervalDays).toBe(1);
+    expect(review?.source).toBe('DAILY_STRUGGLE');
+    expect(review?.triggerReason).toContain('SOLVED_WITH_HINTS');
+    expect(review?.triggerReason).toContain('ALGORITHM_CHOICE');
+    expect(review?.triggerReason).toContain('HARD_DIFFICULTY');
+
+    recommendationService.saveFeedback(problem.id, {
+      solvedStatus: 'SOLVED_INDEPENDENTLY',
+      solutionMethod: 'INDEPENDENT',
+      perceivedDifficulty: 'NORMAL',
+    });
+    const queueCount = db.prepare(
+      'SELECT COUNT(*) AS count FROM review_queue WHERE profile_id = ? AND problem_id = ?'
+    ).get(profileAId, problem.problemId) as { count: number };
+    expect(queueCount.count).toBe(1);
+  });
+
+  it('does not infer strength or mastery from a single successful feedback', () => {
+    const dailySet = recommendationService.getOrGenerateDailySet(profileAId, '2026-10-13');
+    const problem = dailySet.problems[0];
+    const tag = problem.problem?.tags?.[0] || 'greedy';
+    recommendationService.saveFeedback(problem.id, {
+      solvedStatus: 'SOLVED_INDEPENDENTLY',
+      solutionMethod: 'INDEPENDENT',
+      perceivedDifficulty: 'EASY',
+    });
+
+    const topic = analysisService.analyzeTopics(handleA, 1400, profileAId, '2026-10-13')
+      .find((item) => item.tag === tag);
+    expect(topic).toBeDefined();
+    expect(topic?.status).not.toBe('STRONG');
+    expect(topic?.masteryTier).not.toBe('PROFICIENT');
+    expect(topic?.masteryTier).not.toBe('MASTERED');
+  });
+
+  it('moves an existing review forward after a repeated struggle without duplicating it', () => {
+    const dailySet = recommendationService.getOrGenerateDailySet(profileAId, '2026-10-14');
+    const problem = dailySet.problems[0];
+    recommendationService.saveFeedback(problem.id, {
+      solvedStatus: 'SOLVED_WITH_HINTS',
+      solutionMethod: 'HINTS',
+      perceivedDifficulty: 'HARD',
+    });
+
+    reviewService.recordReviewOutcome(profileAId, problem.problemId, 'EASY');
+    const advanced = reviewService.getReviewItem(profileAId, problem.problemId);
+    expect(advanced?.intervalDays).toBe(3);
+
+    recommendationService.saveFeedback(problem.id, {
+      solvedStatus: 'SOLVED_WITH_HINTS',
+      solutionMethod: 'HINTS',
+      perceivedDifficulty: 'HARD',
+    });
+    const requeued = reviewService.getReviewItem(profileAId, problem.problemId);
+    expect(requeued?.intervalDays).toBe(1);
+    expect(requeued?.repetitionCount).toBe(0);
+    expect(Date.parse(requeued!.dueDate)).toBeLessThan(Date.parse(advanced!.dueDate));
+    const queueCount = db.prepare(
+      'SELECT COUNT(*) AS count FROM review_queue WHERE profile_id = ? AND problem_id = ?'
+    ).get(profileAId, problem.problemId) as { count: number };
+    expect(queueCount.count).toBe(1);
   });
 });

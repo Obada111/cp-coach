@@ -43,8 +43,8 @@ export class ReviewService {
    * Calculate future date string given base date and days offset
    */
   private addDays(dateStr: string, days: number): string {
-    const d = new Date(dateStr);
-    d.setDate(d.getDate() + days);
+    const d = new Date(`${dateStr}T00:00:00.000Z`);
+    d.setUTCDate(d.getUTCDate() + days);
     return d.toISOString().slice(0, 10);
   }
 
@@ -85,17 +85,16 @@ export class ReviewService {
         trigger_reason = excluded.trigger_reason,
         source = excluded.source,
         due_date = CASE 
-          WHEN review_queue.state = 'MASTERED' THEN excluded.due_date 
-          ELSE review_queue.due_date 
+          WHEN review_queue.state = 'MASTERED' THEN excluded.due_date
+          WHEN review_queue.due_date <= excluded.due_date THEN review_queue.due_date
+          ELSE excluded.due_date
         END,
         state = CASE 
           WHEN review_queue.state = 'MASTERED' THEN 'DUE' 
           ELSE review_queue.state 
         END,
-        interval_days = CASE
-          WHEN review_queue.state = 'MASTERED' THEN 1
-          ELSE review_queue.interval_days
-        END
+        interval_days = 1,
+        repetition_count = 0
     `).run(
       recordId,
       profileId,

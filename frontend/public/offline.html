@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0c0f1a" />
+    <title>Offline · Codeforces Coach</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #0c0f1a; color: #e2e8f0; }
+      body { min-height: 100vh; margin: 0; display: grid; place-items: center; padding: 24px; box-sizing: border-box; }
+      main { width: min(100%, 440px); padding: 32px; border: 1px solid #263449; border-radius: 20px; background: #111827; box-sizing: border-box; }
+      .mark { width: 48px; height: 48px; display: grid; place-items: center; margin-bottom: 24px; border-radius: 14px; background: #083344; color: #67e8f9; font-size: 24px; font-weight: 800; }
+      h1 { margin: 0 0 12px; font-size: 24px; }
+      p { color: #94a3b8; font-size: 15px; line-height: 1.65; }
+      button { margin-top: 12px; padding: 11px 16px; border: 0; border-radius: 10px; background: #0891b2; color: white; font: inherit; font-weight: 700; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">&lt;/&gt;</div>
+      <h1>You’re offline</h1>
+      <p>Reconnect to the internet to load Codeforces Coach. Live Codeforces data, synchronization, and feedback submissions require an internet connection.</p>
+      <p>Your browser-saved dashboard and learning data are not cleared by an update. Once the app shell has loaded before, you can reopen it to view your saved snapshot offline.</p>
+      <button type="button" onclick="window.location.reload()">Try again</button>
+    </main>
+  </body>
+</html>

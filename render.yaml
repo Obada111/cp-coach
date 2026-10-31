@@ -19,6 +19,12 @@ services:
         value: production
       - key: PUBLIC_MODE
         value: "true"
+      - key: CLOUDFLARE_NOTIFICATIONS_URL
+        sync: false
+      - key: CLOUDFLARE_NOTIFICATIONS_API_SECRET
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
       - key: HOST
         value: "0.0.0.0"
       - key: DB_DIR

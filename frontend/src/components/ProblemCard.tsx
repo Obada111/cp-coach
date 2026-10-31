@@ -56,6 +56,7 @@ export const ProblemCard: React.FC<Props> = ({
   const [notes, setNotes] = useState(item.notes || '');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const isDone = item.verifiedCfAc || item.selfReportedSolved || (item.solvedStatus && item.solvedStatus !== 'NOT_SOLVED');
 
@@ -111,6 +112,7 @@ export const ProblemCard: React.FC<Props> = ({
     e.preventDefault();
     setSaving(true);
     setSaved(false);
+    setSaveError(null);
     try {
       await onSaveFeedback(item.id, {
         solvedStatus,
@@ -121,6 +123,10 @@ export const ProblemCard: React.FC<Props> = ({
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
+    } catch (error) {
+      setSaveError(error instanceof Error
+        ? error.message
+        : 'Could not save your feedback. Check your connection and try again.');
     } finally {
       setSaving(false);
     }
@@ -421,7 +427,8 @@ export const ProblemCard: React.FC<Props> = ({
 
           {/* Save */}
           <div className="flex items-center justify-end gap-2">
-            {saved && <span className="text-xs text-emerald-400 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Saved</span>}
+            {saved && <span role="status" className="text-xs text-emerald-400 flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Saved</span>}
+            {saveError && <p role="alert" className="w-full text-xs text-rose-300">{saveError}</p>}
             <button
               type="submit"
               disabled={saving}

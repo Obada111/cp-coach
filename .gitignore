@@ -33,6 +33,9 @@ logs/
 !.env.example
 !**/.env.example
 !.env.production.example
+**/.dev.vars
+**/.dev.vars.*
+**/.wrangler/
 
 # Build metadata and hosting state
 *.tsbuildinfo

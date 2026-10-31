@@ -1,9 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { db, deletePublicProfile, getOrCreatePublicProfile, getProfilesForOwner } from './db.js';
+import {
+  db,
+  deletePublicProfile,
+  getOrCreatePublicProfile,
+  getProfilesForOwner,
+  getPublicProfileOwner,
+} from './db.js';
 import { codeforcesService } from './codeforcesService.js';
 import { exportPublicContext, importPublicContext } from './publicContextService.js';
 import { apiRouter } from './routes.js';
+import { notificationsService } from './notificationsService.js';
+import { cloudflareNotificationRepository } from './cloudflareNotificationRepository.js';
 
 const CLIENT_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 const HANDLE_PATTERN = /^[A-Za-z0-9_.-]{2,64}$/;
@@ -120,6 +128,33 @@ function requireSessionOwnership(req: Request, res: Response, next: NextFunction
   next();
 }
 
+const NOTIFICATION_SNAPSHOT_MIN_INTERVAL_MS = 60_000;
+const lastNotificationSnapshotSyncAt = new Map<string, number>();
+const inFlightNotificationSnapshots = new Map<string, Promise<void>>();
+
+function scheduleNotificationSnapshotSync(profileId: string, ownerId: string, force = false): void {
+  if (inFlightNotificationSnapshots.has(profileId)) return;
+  const lastSyncAt = lastNotificationSnapshotSyncAt.get(profileId) || 0;
+  if (!force && Date.now() - lastSyncAt < NOTIFICATION_SNAPSHOT_MIN_INTERVAL_MS) return;
+
+  const task = cloudflareNotificationRepository
+    .syncDailySnapshot(profileId, ownerId)
+    .then(() => {
+      lastNotificationSnapshotSyncAt.set(profileId, Date.now());
+    })
+    .catch((error: unknown) => {
+      const reason = error instanceof Error ? error.message : 'Unknown synchronization error';
+      console.warn('[Notifications] Daily snapshot synchronization to Cloudflare failed:', reason);
+    })
+    .finally(() => {
+      if (inFlightNotificationSnapshots.get(profileId) === task) {
+        inFlightNotificationSnapshots.delete(profileId);
+      }
+    });
+
+  inFlightNotificationSnapshots.set(profileId, task);
+}
+
 export const publicRouter = Router();
 
 publicRouter.use((_req, res, next) => {
@@ -192,6 +227,9 @@ publicRouter.post('/profiles', rateLimit('profile-create', 8, 60_000), async (re
   try {
     const validation = await codeforcesService.validateHandle(rawHandle);
     if (!validation.valid || !validation.user) {
+      if (validation.error?.startsWith('Codeforces check failed:')) {
+        return fail(res, 503, 'Codeforces could not be reached right now. Please try again in a moment.');
+      }
       return fail(res, 400, validation.error || `Codeforces handle '${rawHandle}' could not be verified.`);
     }
     const profile = getOrCreatePublicProfile(
@@ -218,9 +256,19 @@ publicRouter.post('/profiles/:id/select', (req, res) => {
   res.json({ success: true, profile });
 });
 
-publicRouter.delete('/profiles/:id', (req, res) => {
+publicRouter.delete('/profiles/:id', async (req, res) => {
   const clientId = getClientId(req);
   if (!clientId) return fail(res, 400, 'A valid X-Coach-Client-Id header is required');
+  const ownerId = clientId.trim().toLowerCase();
+  if (getPublicProfileOwner(req.params.id) !== ownerId) return fail(res, 404, 'Profile not found');
+  if (cloudflareNotificationRepository.isConfigured()) {
+    try {
+      await cloudflareNotificationRepository.deleteProfile(req.params.id, ownerId);
+    } catch {
+      console.warn('[Notifications] Profile removal could not be synchronized to Cloudflare.');
+      return fail(res, 503, 'Could not remove notification data. Please try again.');
+    }
+  }
   try {
     if (!deletePublicProfile(clientId, req.params.id)) return fail(res, 404, 'Profile not found');
     res.json({ success: true, message: 'Profile removed from this browser.' });
@@ -236,6 +284,9 @@ publicRouter.get('/handle/validate', rateLimit('handle-validate', 20, 60_000), a
   try {
     const validation = await codeforcesService.validateHandle(handle);
     if (!validation.valid || !validation.user) {
+      if (validation.error?.startsWith('Codeforces check failed:')) {
+        return fail(res, 503, 'Codeforces could not be reached right now. Please try again in a moment.');
+      }
       return fail(res, 400, validation.error || 'Codeforces handle could not be verified');
     }
     res.json({ valid: true, user: validation.user });
@@ -252,15 +303,36 @@ publicRouter.use((req, res, next) => {
   if (!handle) return fail(res, 400, 'A valid Codeforces handle is required');
 
   try {
+    const ownerId = clientId.trim().toLowerCase();
     const profile = getOrCreatePublicProfile(clientId, handle);
     (req as any).publicProfile = profile;
-    (req as any).publicClientId = clientId;
+    (req as any).publicClientId = ownerId;
 
     if (req.query && typeof req.query === 'object') {
       (req.query as any).profileId = profile.id;
     }
     if (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) {
       req.body.profileId = profile.id;
+    }
+    const shouldSyncNotificationSnapshot =
+      (req.method === 'GET' && ['/dashboard', '/daily'].includes(req.path)) ||
+      (req.method !== 'GET' && [
+        '/context',
+        '/sync',
+        '/daily/replace',
+      ].includes(req.path)) ||
+      (req.method === 'POST' && /^\/problems\/[^/]+\/feedback$/.test(req.path));
+    if (shouldSyncNotificationSnapshot && cloudflareNotificationRepository.isConfigured()) {
+      const sendJson = res.json.bind(res);
+      let snapshotScheduled = false;
+      res.json = ((body?: any) => {
+        const result = sendJson(body);
+        if (res.statusCode < 400 && !snapshotScheduled) {
+          snapshotScheduled = true;
+          scheduleNotificationSnapshotSync(profile.id, ownerId, req.method !== 'GET');
+        }
+        return result;
+      }) as typeof res.json;
     }
     next();
   } catch (err) {
@@ -279,15 +351,29 @@ publicRouter.get('/context', (req, res) => {
   }
 });
 
-publicRouter.post('/context', (req, res) => {
+publicRouter.post('/context', rateLimit('context-import', 25, 60_000), (req, res) => {
   try {
     const profileId = (req as any).publicProfile.id as string;
     const context = req.body?.context ?? req.body;
-    const result = importPublicContext(profileId, context);
+    const requestedMode = req.body?.mode;
+    if (requestedMode !== undefined && requestedMode !== 'merge' && requestedMode !== 'replace') {
+      return fail(res, 400, 'Import mode must be merge or replace');
+    }
+    const result = importPublicContext(profileId, context, { mode: requestedMode || 'merge' });
     res.json(result);
   } catch (err: any) {
-    console.warn('[PublicAPI] Context restore rejected:', err?.message || err);
-    fail(res, 400, 'Could not restore browser context');
+    const message = String(err?.message || '');
+    const safeMessage = (
+      message === 'Context must be an object' ||
+      message === 'Import mode must be merge or replace' ||
+      message === 'This backup belongs to a different Codeforces handle' ||
+      message.startsWith('Unsupported context version:') ||
+      message.startsWith('Invalid browser context') ||
+      message.startsWith('Invalid learner-state timestamp') ||
+      message.startsWith('Backup ')
+    ) ? message : 'Could not restore browser context';
+    console.warn('[PublicAPI] Context restore rejected:', message || err);
+    fail(res, 400, safeMessage);
   }
 });
 
@@ -302,6 +388,122 @@ publicRouter.post('/reviews/:problemId/action', requireReviewOwnership);
 publicRouter.post('/sessions/:id/hint', requireSessionOwnership);
 publicRouter.post('/sessions/:id/editorial', requireSessionOwnership);
 publicRouter.post('/sessions/:id/finish', requireSessionOwnership);
+
+publicRouter.get('/notifications/config', (_req, res) => {
+  res.json(notificationsService.getPublicConfig());
+});
+
+publicRouter.get('/notifications/settings', async (req, res) => {
+  try {
+    const profileId = (req as any).publicProfile.id as string;
+    if (cloudflareNotificationRepository.isConfigured()) {
+      const ownerId = (req as any).publicClientId as string;
+      const handle = (req as any).publicProfile.handle as string;
+      const settings = await cloudflareNotificationRepository.getSettings(profileId, ownerId, handle);
+      return res.json({ available: notificationsService.isAvailable(), settings });
+    }
+    res.json({
+      available: notificationsService.isAvailable(),
+      settings: notificationsService.getSettings(profileId),
+    });
+  } catch (err) {
+    console.error('[PublicAPI] Failed to load notification settings:', err);
+    fail(res, 500, 'Could not load notification settings');
+  }
+});
+
+publicRouter.get('/notifications/subscriptions/status', async (req, res) => {
+  const profileId = (req as any).publicProfile.id as string;
+  const ownerId = (req as any).publicClientId as string;
+  const handle = (req as any).publicProfile.handle as string;
+  try {
+    const registered = cloudflareNotificationRepository.isConfigured()
+      ? await cloudflareNotificationRepository.hasSubscription(profileId, ownerId, handle, req.query.endpoint)
+      : notificationsService.hasSubscription(profileId, ownerId, req.query.endpoint);
+    res.json({ registered });
+  } catch (err) {
+    console.error('[PublicAPI] Failed to verify push subscription state:', err);
+    fail(res, 503, 'Could not verify this device subscription');
+  }
+});
+
+publicRouter.put('/notifications/settings', async (req, res) => {
+  try {
+    const profileId = (req as any).publicProfile.id as string;
+    const ownerId = (req as any).publicClientId as string;
+    const handle = (req as any).publicProfile.handle as string;
+    const input = {
+      contestReminders: req.body?.contestReminders,
+      dailyReminders: req.body?.dailyReminders,
+      reminderTime: req.body?.reminderTime,
+    };
+    if (
+      typeof input.contestReminders !== 'boolean' ||
+      typeof input.dailyReminders !== 'boolean'
+    ) {
+      return fail(res, 400, 'Reminder settings must be boolean values');
+    }
+    if (typeof input.reminderTime !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(input.reminderTime)) {
+      return fail(res, 400, 'Reminder time must use 24-hour HH:mm format');
+    }
+    const settings = cloudflareNotificationRepository.isConfigured()
+      ? await cloudflareNotificationRepository.updateSettings(profileId, ownerId, handle, input)
+      : notificationsService.updateSettings(profileId, input);
+    res.json({ success: true, settings });
+  } catch (err: any) {
+    const message = err?.message === 'Reminder time must use 24-hour HH:mm format' ||
+      err?.message === 'Reminder settings must be boolean values'
+      ? err.message
+      : 'Could not update notification settings';
+    if (message !== 'Could not update notification settings') return fail(res, 400, message);
+    console.error('[PublicAPI] Failed to update notification settings:', err);
+    fail(res, 500, message);
+  }
+});
+
+publicRouter.post('/notifications/subscriptions', async (req, res) => {
+  if (!notificationsService.isAvailable()) {
+    return fail(res, 503, 'Push notifications are not configured for this deployment');
+  }
+  try {
+    const profileId = (req as any).publicProfile.id as string;
+    const ownerId = (req as any).publicClientId as string;
+    const handle = (req as any).publicProfile.handle as string;
+    if (cloudflareNotificationRepository.isConfigured()) {
+      await cloudflareNotificationRepository.registerSubscription(profileId, ownerId, handle, req.body?.subscription);
+    } else {
+      notificationsService.registerSubscription(profileId, ownerId, req.body?.subscription);
+    }
+    res.status(201).json({ success: true });
+  } catch (err: any) {
+    if (
+      err?.message === 'A valid HTTPS push subscription is required' ||
+      err?.message === 'This device is already registered to another profile'
+    ) {
+      return fail(res, err.message.startsWith('This device') ? 409 : 400, err.message);
+    }
+    console.error('[PublicAPI] Failed to register push subscription:', err);
+    fail(res, 500, 'Could not register this device for push notifications');
+  }
+});
+
+publicRouter.delete('/notifications/subscriptions', async (req, res) => {
+  try {
+    const profileId = (req as any).publicProfile.id as string;
+    const ownerId = (req as any).publicClientId as string;
+    const handle = (req as any).publicProfile.handle as string;
+    if (cloudflareNotificationRepository.isConfigured()) {
+      await cloudflareNotificationRepository.removeSubscription(profileId, ownerId, handle, req.body?.endpoint);
+    } else {
+      notificationsService.removeSubscription(profileId, ownerId, req.body?.endpoint);
+    }
+    res.json({ success: true });
+  } catch (err: any) {
+    if (err?.message === 'A valid push endpoint is required') return fail(res, 400, err.message);
+    console.error('[PublicAPI] Failed to remove push subscription:', err);
+    fail(res, 500, 'Could not remove this device subscription');
+  }
+});
 
 // Codeforces-backed operations are more expensive than ordinary reads and
 // writes, so they get a tighter per-IP budget in addition to the global one.

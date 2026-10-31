@@ -256,6 +256,34 @@ export interface LearnerWeeklyReview {
   generatedAt: string;
 }
 
+export interface WeeklyReportPeriod {
+  from: string;
+  through: string;
+  attempted: number;
+  solved: number;
+  independentlySolved: number;
+  requiredHints: number;
+  requiredEditorial: number;
+}
+
+export interface WeeklyCoachReport {
+  generatedAt: string;
+  currentPeriod: WeeklyReportPeriod;
+  previousPeriod: WeeklyReportPeriod;
+  hasComparison: boolean;
+  comparisonExplanation: string;
+  topicImprovements: Array<{
+    topic: string;
+    currentRate: number;
+    previousRate: number;
+    change: number;
+    evidence: string;
+  }>;
+  practiceTopics: Array<{ topic: string; explanation: string }>;
+  repeatedMistakes: Array<{ reason: string; count: number }>;
+  priorities: string[];
+}
+
 export interface LearnerModel {
   profileId: string;
   handle: string;
@@ -566,4 +594,3 @@ export interface TrainingPlan {
   skillTracks: SkillTrack[];
   recommendedFocus: string;
 }
-

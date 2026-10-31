@@ -8,18 +8,20 @@ import {
   Sparkles, 
   Filter
 } from 'lucide-react';
-import { SkillTrack, MasteryTier } from '../types';
+import { SkillTrack, MasteryTier, ProblemLearningEvent } from '../types';
 import { fetchSkillTracks } from '../api';
 
 interface SkillTracksViewProps {
   profileId: string;
+  events: ProblemLearningEvent[];
 }
 
-export const SkillTracksView: React.FC<SkillTracksViewProps> = ({ profileId }) => {
+export const SkillTracksView: React.FC<SkillTracksViewProps> = ({ profileId, events }) => {
   const [tracks, setTracks] = useState<SkillTrack[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filterTier, setFilterTier] = useState<string>('ALL');
+  const [selectedTrackKey, setSelectedTrackKey] = useState<string | null>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -94,6 +96,26 @@ export const SkillTracksView: React.FC<SkillTracksViewProps> = ({ profileId }) =
   const masteredCount = tracks.filter((t) => t.masteryTier === 'MASTERED').length;
   const developingCount = tracks.filter((t) => t.masteryTier === 'DEVELOPING' || t.masteryTier === 'PROFICIENT').length;
   const unexploredCount = tracks.filter((t) => t.masteryTier === 'UNEXPLORED').length;
+  const getTrackEvidence = (track: SkillTrack) => {
+    const relevant = events.filter((event) =>
+      event.tags.some((tag) => track.tags.includes(tag.toLowerCase()))
+    );
+    const withOutcome = relevant.filter((event) =>
+      event.solvedStatus || event.solutionMethod || event.verifiedAc
+    );
+    const distinctProblems = new Set(withOutcome.map((event) => event.problemId));
+    const independent = new Set(withOutcome
+      .filter((event) => event.solvedStatus === 'SOLVED_INDEPENDENTLY' || event.solutionMethod === 'INDEPENDENT')
+      .map((event) => event.problemId));
+    const hints = new Set(withOutcome
+      .filter((event) => event.solvedStatus === 'SOLVED_WITH_HINTS' || event.solutionMethod === 'HINTS')
+      .map((event) => event.problemId));
+    const editorials = new Set(withOutcome
+      .filter((event) => event.solvedStatus === 'VIEWED_EDITORIAL' || event.solutionMethod === 'EDITORIAL' || event.editorialViewed)
+      .map((event) => event.problemId));
+    const latestEvents = relevant.slice(0, 6);
+    return { relevant, distinctProblems, independent, hints, editorials, latestEvents };
+  };
 
   return (
     <div className="space-y-6">
@@ -200,7 +222,7 @@ export const SkillTracksView: React.FC<SkillTracksViewProps> = ({ profileId }) =
                 </div>
 
                 {/* Sub-stats Row */}
-                <div className="grid grid-cols-3 gap-2 py-2 px-3 rounded-xl bg-slate-800/40 border border-slate-800 text-xs mb-3">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 py-2 px-3 rounded-xl bg-slate-800/40 border border-slate-800 text-xs mb-3">
                   <div>
                     <div className="text-[10px] text-slate-400 uppercase">Solve Rate</div>
                     <div className="font-semibold text-slate-200">{track.solveRate}%</div>
@@ -223,7 +245,47 @@ export const SkillTracksView: React.FC<SkillTracksViewProps> = ({ profileId }) =
                       )}
                     </div>
                   </div>
+                  <div>
+                    <div className="text-[10px] text-slate-400 uppercase">Evidence</div>
+                    <div className="font-semibold text-slate-200">{track.confidence.toLowerCase()} · {track.attemptsCount}</div>
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedTrackKey(selectedTrackKey === track.key ? null : track.key)}
+                  className="text-[11px] text-cyan-400 hover:text-cyan-300"
+                >
+                  {selectedTrackKey === track.key ? 'Hide topic history' : 'View topic history'}
+                </button>
+                {selectedTrackKey === track.key && (() => {
+                  const evidence = getTrackEvidence(track);
+                  return (
+                    <div className="mt-3 p-3 rounded-lg bg-slate-950/70 border border-slate-800 space-y-2">
+                      <p className="text-[10px] text-slate-500">
+                        Recorded learning evidence, not reconstructed historical mastery scores. {evidence.distinctProblems.size} distinct problem(s) have explicit outcomes.
+                      </p>
+                      <div className="flex flex-wrap gap-3 text-[10px]">
+                        <span className="text-emerald-300">{evidence.independent.size} independent</span>
+                        <span className="text-amber-300">{evidence.hints.size} with hints</span>
+                        <span className="text-rose-300">{evidence.editorials.size} editorial-dependent</span>
+                      </div>
+                      {evidence.latestEvents.length === 0 ? (
+                        <p className="text-[11px] text-slate-500">No recent journal records for this track.</p>
+                      ) : (
+                        <ul className="space-y-1.5">
+                          {evidence.latestEvents.map((event) => (
+                            <li key={event.id} className="text-[10px] text-slate-400">
+                              <span className="text-slate-200">{event.problemName}</span>
+                              {' · '}{new Date(event.occurredAt).toLocaleDateString()}
+                              {' · '}{event.solvedStatus?.replace(/_/g, ' ') || event.solutionMethod?.replace(/_/g, ' ') || (event.verifiedAc ? 'Verified AC' : 'Encounter')}
+                              {event.struggleReason && <span className="text-amber-400"> · {event.struggleReason.toLowerCase().replace(/_/g, ' ')}</span>}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* Actionable Next Step Recommendation */}

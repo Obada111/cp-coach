@@ -6,6 +6,7 @@ import { apiRouter } from './routes.js';
 import { publicRouter } from './publicRoutes.js';
 import { requireApiToken, requireConfiguredToken } from './auth.js';
 import { codeforcesCacheService } from './codeforcesCacheService.js';
+import { notificationsService } from './notificationsService.js';
 
 import path from 'path';
 import fs from 'fs';
@@ -16,8 +17,22 @@ const __dirname = path.dirname(__filename);
 
 dotenv.config();
 
+// Keep local loopback traffic off any proxy configuration so localhost API
+// checks and browser-local dev servers remain reliable.
+process.env.NO_PROXY = process.env.NO_PROXY || 'localhost,127.0.0.1,[::1],*';
+process.env.no_proxy = process.env.no_proxy || process.env.NO_PROXY;
+
 // Initialize SQLite database
+const databaseInitStartedAt = performance.now();
 initDatabase();
+if (process.env.PERF_TIMINGS === 'true') {
+  console.log(JSON.stringify({
+    scope: 'perf',
+    label: 'startup',
+    databaseInitMs: Math.round((performance.now() - databaseInitStartedAt) * 10) / 10,
+  }));
+}
+notificationsService.startBackgroundWorker();
 
 const app = express();
 app.set('trust proxy', 1);
@@ -64,7 +79,12 @@ app.use((_req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '1mb' }));
+const defaultJsonParser = express.json({ limit: '1mb' });
+const backupJsonParser = express.json({ limit: '11mb' });
+app.use((req, res, next) => {
+  const isContextImport = req.method === 'POST' && req.path === '/api/public/context';
+  return (isContextImport ? backupJsonParser : defaultJsonParser)(req, res, next);
+});
 
 // Public browser API: no server secret is embedded in the frontend.
 app.use('/api/public', publicRouter);
@@ -137,6 +157,7 @@ const shutdown = async (signal: string): Promise<void> => {
     server.close(() => resolve());
   });
   await codeforcesCacheService.shutdown();
+  await notificationsService.shutdown();
   db.close();
   console.log('[CP Coach Backend] Shutdown complete.');
 };

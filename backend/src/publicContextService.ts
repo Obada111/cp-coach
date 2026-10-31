@@ -1,4 +1,5 @@
 ﻿import { db, getProfileById } from './db.js';
+import { createHash } from 'node:crypto';
 
 /**
  * Browser-owned personal state.
@@ -10,14 +11,26 @@
  */
 export const PUBLIC_CONTEXT_VERSION = 1;
 
-const MAX_DAILY_SETS = 90;
-const MAX_DAILY_PROBLEMS = 360;
-const MAX_REVIEW_ITEMS = 500;
-const MAX_SESSIONS = 300;
-const MAX_CONTEST_REVIEWS = 300;
-const MAX_USER_CONTESTS = 300;
-const MAX_WEEKLY_GOALS = 52;
-const MAX_LEARNING_EVENTS = 750;
+const preparedStatements = new Map<string, ReturnType<typeof db.prepare>>();
+
+function prepareCached(sql: string): ReturnType<typeof db.prepare> {
+  let statement = preparedStatements.get(sql);
+  if (!statement) {
+    statement = db.prepare(sql);
+    preparedStatements.set(sql, statement);
+  }
+  return statement;
+}
+
+const MAX_DAILY_SETS = 10000;
+const MAX_DAILY_PROBLEMS = 30000;
+const MAX_REVIEW_ITEMS = 20000;
+const MAX_SESSIONS = 20000;
+const MAX_CONTEST_REVIEWS = 10000;
+const MAX_USER_CONTESTS = 5000;
+const MAX_WEEKLY_GOALS = 5000;
+const MAX_LEARNING_EVENTS = 50000;
+const MAX_PROBLEMS = 50000;
 
 const PERSONAL_TABLES = {
   dailySets: {
@@ -122,7 +135,9 @@ function isRecord(value: unknown): value is Row {
 
 function stringValue(value: unknown, max = 20000): string | null {
   if (value === null || value === undefined) return null;
-  return String(value).slice(0, max);
+  const text = String(value);
+  if (text.length > max) throw new Error(`Backup text field exceeds the ${max}-character safety limit`);
+  return text;
 }
 
 function numberValue(value: unknown): number | null {
@@ -141,18 +156,22 @@ function sqlValue(value: unknown): string | number | null {
 
 function jsonValue(value: unknown): string {
   if (typeof value === 'string') {
-    if (value.length <= 20000) {
-      try {
-        JSON.parse(value);
-        return value;
-      } catch {
-        return '[]';
-      }
+    if (value.length > 250000) {
+      throw new Error('Backup JSON field exceeds the 250000-character safety limit');
     }
-    return '[]';
+    try {
+      JSON.parse(value);
+      return value;
+    } catch {
+      throw new Error('Backup contains malformed JSON data');
+    }
   }
   if (Array.isArray(value)) {
-    return JSON.stringify(value.slice(0, 50).map((item) => String(item).slice(0, 100)));
+    const serialized = JSON.stringify(value);
+    if (serialized.length > 250000) {
+      throw new Error('Backup JSON field exceeds the 250000-character safety limit');
+    }
+    return serialized;
   }
   return '[]';
 }
@@ -211,7 +230,7 @@ function cleanColumn(column: string, value: unknown): unknown {
   return stringValue(value);
 }
 
-function pickColumns(row: Row, columns: readonly string[], overrides: Row = {}): Row | null {
+function pickColumns(row: Row, columns: readonly string[], overrides: Row = {}): Row {
   const picked: Row = {};
   for (const column of columns) {
     let value = Object.prototype.hasOwnProperty.call(overrides, column)
@@ -239,22 +258,34 @@ function selectPersonalRows(
     WHERE profile_id = ?
     ORDER BY ${config.orderBy}
     LIMIT ?
-  `).all(profileId, config.limit) as Row[];
+  `).all(profileId, config.limit + 1) as Row[];
+  if (rows.length > config.limit) {
+    throw new Error(`Backup safety limit exceeded for ${config.table}; no records were omitted from the export.`);
+  }
   return rows;
 }
 
 function selectIn(columns: string[], table: string, ids: string[]): Row[] {
   if (ids.length === 0) return [];
-  const unique = Array.from(new Set(ids.filter(Boolean))).slice(0, 1500);
-  const placeholders = unique.map(() => '?').join(', ');
-  return db.prepare(
-    `SELECT ${columns.join(', ')} FROM ${table} WHERE id IN (${placeholders})`
-  ).all(...unique) as Row[];
+  const unique = Array.from(new Set(ids.filter(Boolean)));
+  const rows: Row[] = [];
+  for (let offset = 0; offset < unique.length; offset += 500) {
+    const batch = unique.slice(offset, offset + 500);
+    const placeholders = batch.map(() => '?').join(', ');
+    rows.push(...db.prepare(
+      `SELECT ${columns.join(', ')} FROM ${table} WHERE id IN (${placeholders})`
+    ).all(...batch) as Row[]);
+  }
+  if (rows.length > MAX_PROBLEMS) {
+    throw new Error(`Backup safety limit exceeded for ${table}; no records were omitted from the export.`);
+  }
+  return rows;
 }
 
 export interface PublicContextSnapshot {
   version: number;
   exportedAt: string;
+  profileId: string;
   handle: string;
   profile: {
     handle: string;
@@ -310,6 +341,7 @@ export function exportPublicContext(profileId: string): PublicContextSnapshot {
   return {
     version: PUBLIC_CONTEXT_VERSION,
     exportedAt: new Date().toISOString(),
+    profileId,
     handle: profile.handle,
     profile: {
       handle: profile.handle,
@@ -339,6 +371,127 @@ function asRows(value: unknown, max: number): Row[] {
   return value.slice(0, max).filter(isRecord);
 }
 
+function validDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function validTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const iso = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  const sqlite = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?$/.exec(value);
+  const match = iso || sqlite;
+  if (!match) return false;
+  const [, year, month, day, hour, minute, second] = match;
+  if (
+    !validDate(`${year}-${month}-${day}`) ||
+    Number(hour) > 23 ||
+    Number(minute) > 59 ||
+    Number(second) > 59
+  ) return false;
+  const timezone = iso?.[8];
+  if (timezone && timezone !== 'Z') {
+    const [, , offsetHours, offsetMinutes] = /^([+-])(\d{2}):(\d{2})$/.exec(timezone) || [];
+    if (
+      offsetHours === undefined ||
+      Number(offsetHours) > 14 ||
+      Number(offsetMinutes) > 59 ||
+      (Number(offsetHours) === 14 && Number(offsetMinutes) !== 0)
+    ) return false;
+  }
+  const normalized = sqlite ? `${value.replace(' ', 'T')}Z` : value;
+  return Number.isFinite(Date.parse(normalized));
+}
+
+function validateContextRows(raw: Row): void {
+  const limits: Record<string, number> = {
+    dailySets: MAX_DAILY_SETS,
+    dailyProblems: MAX_DAILY_PROBLEMS,
+    reviewQueue: MAX_REVIEW_ITEMS,
+    solveSessions: MAX_SESSIONS,
+    contestReviews: MAX_CONTEST_REVIEWS,
+    userContests: MAX_USER_CONTESTS,
+    weeklyGoals: MAX_WEEKLY_GOALS,
+    learningEvents: MAX_LEARNING_EVENTS,
+    problems: MAX_PROBLEMS,
+    contestProblemsMeta: MAX_PROBLEMS,
+  };
+  const requiredKeys: Record<string, string[]> = {
+    dailySets: ['id'],
+    dailyProblems: ['id'],
+    reviewQueue: ['profile_id', 'problem_id'],
+    solveSessions: ['id'],
+    contestReviews: ['profile_id', 'contest_id', 'problem_index'],
+    userContests: ['profile_id', 'contest_id'],
+    weeklyGoals: ['profile_id', 'week_start_date'],
+    learningEvents: ['id'],
+    problems: ['id'],
+    contestProblemsMeta: ['contest_id', 'problem_index'],
+  };
+  const timestampKeys: Record<string, string[]> = {
+    dailySets: ['generated_at'],
+    dailyProblems: ['updated_at', 'opened_at'],
+    reviewQueue: ['added_at', 'last_reviewed_at'],
+    solveSessions: ['started_at', 'ended_at', 'created_at', 'updated_at'],
+    contestReviews: ['updated_at'],
+    userContests: ['created_at', 'updated_at'],
+    weeklyGoals: ['updated_at'],
+    learningEvents: ['occurred_at'],
+    problems: ['updated_at'],
+  };
+  const dateKeys: Record<string, string[]> = {
+    dailySets: ['date'],
+    dailyProblems: ['daily_set_date'],
+    reviewQueue: ['due_date'],
+    weeklyGoals: ['week_start_date'],
+  };
+  for (const [field, limit] of Object.entries(limits)) {
+    const rows = raw[field];
+    if (!Array.isArray(rows) || rows.length > limit) {
+      throw new Error(`Invalid browser context field: ${field}`);
+    }
+    const required = requiredKeys[field] || [];
+    const timestamps = timestampKeys[field] || [];
+    const dates = dateKeys[field] || [];
+    for (const row of rows) {
+      if (!isRecord(row)) throw new Error(`Invalid browser context field: ${field}`);
+      for (const key of required) {
+        const value = row[key];
+        const valid = typeof value === 'string'
+          ? value.trim().length > 0
+          : typeof value === 'number' && Number.isFinite(value);
+        if (!valid) throw new Error(`Invalid browser context field: ${field}`);
+      }
+      for (const key of timestamps) {
+        if (row[key] !== null && row[key] !== undefined && !validTimestamp(row[key])) {
+          throw new Error(`Invalid browser context field: ${field}`);
+        }
+      }
+      for (const key of dates) {
+        if (row[key] !== null && row[key] !== undefined && !validDate(row[key])) {
+          throw new Error(`Invalid browser context field: ${field}`);
+        }
+      }
+    }
+  }
+  if (raw.exportedAt !== undefined && !validTimestamp(raw.exportedAt)) {
+    throw new Error('Invalid browser context export timestamp');
+  }
+  if (raw.profileId !== undefined && (typeof raw.profileId !== 'string' || !raw.profileId.trim())) {
+    throw new Error('Invalid browser context source profile ID');
+  }
+  if (raw.learnerState !== null && raw.learnerState !== undefined && !isRecord(raw.learnerState)) {
+    throw new Error('Invalid browser context field: learnerState');
+  }
+  if (
+    isRecord(raw.learnerState) &&
+    raw.learnerState.updated_at !== undefined &&
+    !validTimestamp(raw.learnerState.updated_at)
+  ) {
+    throw new Error('Invalid learner-state timestamp');
+  }
+}
 function upsertRow(
   table: string,
   columns: string[],
@@ -353,7 +506,7 @@ function upsertRow(
         .map((column) => `${column} = excluded.${column}`)
         .join(', ')}`
     : 'DO NOTHING';
-  const result = db.prepare(`
+  const result = prepareCached(`
     INSERT INTO ${table} (${columns.join(', ')})
     VALUES (${placeholders})
     ON CONFLICT(${conflictColumn}) ${conflict}
@@ -383,7 +536,7 @@ function upsertPersonalRow(
     : '';
   // No conflict target: browser snapshots may reuse a natural key (for
   // example profile_id + week_start_date) with a different generated id.
-  const result = db.prepare(`
+  const result = prepareCached(`
     INSERT INTO ${table} (${columns.join(', ')})
     VALUES (${placeholders})
     ON CONFLICT DO UPDATE SET ${updates} ${guard}
@@ -392,19 +545,91 @@ function upsertPersonalRow(
 }
 
 function canWritePersonalRow(table: string, id: string, profileId: string): boolean {
-  const existing = db.prepare(`SELECT profile_id FROM ${table} WHERE id = ?`).get(id) as
+  const existing = prepareCached(`SELECT profile_id FROM ${table} WHERE id = ?`).get(id) as
     | { profile_id: string }
     | undefined;
   return !existing || existing.profile_id === profileId;
 }
 
+function stableId(prefix: string, ...parts: string[]): string {
+  const digest = createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32);
+  return `${prefix}_${digest}`;
+}
+
+function resolveSourceProfileId(raw: Row, destinationProfileId: string): string {
+  const sourceIds = new Set<string>();
+  if (typeof raw.profileId === 'string' && raw.profileId.trim()) sourceIds.add(raw.profileId.trim());
+  for (const field of Object.keys(PERSONAL_TABLES)) {
+    const rows = raw[field] as Row[];
+    for (const row of rows) {
+      if (typeof row.profile_id === 'string' && row.profile_id.trim()) sourceIds.add(row.profile_id.trim());
+    }
+  }
+  if (isRecord(raw.learnerState) && typeof raw.learnerState.profile_id === 'string') {
+    sourceIds.add(raw.learnerState.profile_id);
+  }
+  if (sourceIds.size > 1) {
+    throw new Error('Backup contains personal records from multiple source profiles');
+  }
+  return sourceIds.values().next().value || destinationProfileId;
+}
+
+function remappedSourceKey(destinationProfileId: string, sourceProfileId: string, sourceKey: string): string {
+  return stableId('restore_source', destinationProfileId, sourceProfileId, sourceKey);
+}
+
+function remapLearnerStateProfileIds(value: unknown, sourceProfileId: string, destinationProfileId: string): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => remapLearnerStateProfileIds(item, sourceProfileId, destinationProfileId));
+  }
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    (key === 'profileId' || key === 'profile_id') && item === sourceProfileId
+      ? destinationProfileId
+      : remapLearnerStateProfileIds(item, sourceProfileId, destinationProfileId),
+  ]));
+}
+
+function remapLearnerStateJson(value: unknown, sourceProfileId: string, destinationProfileId: string): string {
+  if (typeof value !== 'string' || value.length > 250000) {
+    throw new Error('Backup learner state is missing or exceeds the supported size.');
+  }
+  try {
+    return JSON.stringify(remapLearnerStateProfileIds(
+      JSON.parse(value),
+      sourceProfileId,
+      destinationProfileId
+    ));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('Backup learner state')) throw error;
+    throw new Error('Backup learner state contains malformed JSON.');
+  }
+}
+
+export type ContextImportMode = 'merge' | 'replace';
+
 export interface ImportContextResult {
   imported: boolean;
   counts: Record<string, number>;
   skipped: number;
+  mode: ContextImportMode;
 }
 
-export function importPublicContext(profileId: string, raw: unknown): ImportContextResult {
+const PERSONAL_TABLE_NAMES = Object.values(PERSONAL_TABLES).map((table) => table.table);
+
+function clearPersonalContext(profileId: string): void {
+  for (const table of PERSONAL_TABLE_NAMES) {
+    db.prepare(`DELETE FROM ${table} WHERE profile_id = ?`).run(profileId);
+  }
+  db.prepare('DELETE FROM learner_profile_state WHERE profile_id = ?').run(profileId);
+}
+
+export function importPublicContext(
+  profileId: string,
+  raw: unknown,
+  options: { mode?: ContextImportMode } = {}
+): ImportContextResult {
   const profile = getProfileById(profileId);
   if (!profile) throw new Error('Profile not found');
   if (!isRecord(raw)) throw new Error('Context must be an object');
@@ -412,8 +637,19 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
     throw new Error(`Unsupported context version: ${String(raw.version)}`);
   }
 
+  const mode = options.mode ?? 'merge';
+  if (mode !== 'merge' && mode !== 'replace') {
+    throw new Error('Import mode must be merge or replace');
+  }
+
+  const snapshotHandle = stringValue(raw.handle, 64);
+  if (snapshotHandle && snapshotHandle.toLowerCase() !== profile.handle.toLowerCase()) {
+    throw new Error('This backup belongs to a different Codeforces handle');
+  }
+  validateContextRows(raw);
+
   const counts: Record<string, number> = {};
-  let skipped = 0;
+  const skipped = 0;
 
   const dailySets = asRows(raw.dailySets, MAX_DAILY_SETS);
   const dailyProblems = asRows(raw.dailyProblems, MAX_DAILY_PROBLEMS);
@@ -423,16 +659,52 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
   const userContests = asRows(raw.userContests, MAX_USER_CONTESTS);
   const weeklyGoals = asRows(raw.weeklyGoals, MAX_WEEKLY_GOALS);
   const learningEvents = asRows(raw.learningEvents, MAX_LEARNING_EVENTS);
-  const problems = asRows(raw.problems, 1500);
-  const contestProblemsMeta = asRows(raw.contestProblemsMeta, 1500);
+  const problems = asRows(raw.problems, MAX_PROBLEMS);
+  const contestProblemsMeta = asRows(raw.contestProblemsMeta, MAX_PROBLEMS);
+  const sourceProfileId = resolveSourceProfileId(raw, profileId);
+  const profileMapping = new Map([[sourceProfileId, profileId]]);
+  const mappedProfileId = profileMapping.get(sourceProfileId);
+  if (!mappedProfileId) throw new Error('Backup source profile could not be mapped');
+  const sourceDailySetIds = new Set<string>();
+  for (const row of dailySets) {
+    const id = stringValue(row.id, 200);
+    const date = stringValue(row.date, 10);
+    if (!id || !date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || new Date(`${date}T00:00:00.000Z`).toISOString().slice(0, 10) !== date) {
+      throw new Error('Backup contains an invalid daily set identity or date');
+    }
+    sourceDailySetIds.add(id);
+  }
+  for (const row of dailyProblems) {
+    if (!sourceDailySetIds.has(String(row.daily_set_id || ''))) {
+      throw new Error('Backup contains a daily problem without its source daily set');
+    }
+  }
+  for (const field of Object.keys(PERSONAL_TABLES)) {
+    for (const row of asRows(raw[field], PERSONAL_TABLES[field as keyof typeof PERSONAL_TABLES].limit)) {
+      if (row.profile_id !== undefined && String(row.profile_id) !== sourceProfileId) {
+        throw new Error(`Backup field ${field} contains a record from another source profile`);
+      }
+    }
+  }
+  if (
+    isRecord(raw.learnerState) &&
+    raw.learnerState.profile_id !== undefined &&
+    String(raw.learnerState.profile_id) !== sourceProfileId
+  ) {
+    throw new Error('Backup learner state belongs to another source profile');
+  }
 
   db.exec('BEGIN TRANSACTION');
   try {
+    if (mode === 'replace') {
+      clearPersonalContext(profileId);
+    }
+
     for (const row of problems) {
       const id = stringValue(row.id, 200);
       const contestId = numberValue(row.contest_id);
       const index = stringValue(row.problem_index, 50);
-      if (!id || contestId === null || !index) { skipped++; continue; }
+      if (!id || contestId === null || !index) throw new Error('Backup contains an invalid problem identity');
       const cleaned = pickColumns(row, PROBLEM_COLUMNS, { id, contest_id: contestId, problem_index: index });
       if (cleaned) counts.problems = (counts.problems || 0) + upsertRow('problems', PROBLEM_COLUMNS, cleaned, 'id', false);
     }
@@ -441,7 +713,7 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
       const id = stringValue(row.id, 200);
       const contestId = numberValue(row.contest_id);
       const index = stringValue(row.problem_index, 50);
-      if (!id || contestId === null || !index) { skipped++; continue; }
+      if (!id || contestId === null || !index) throw new Error('Backup contains an invalid contest-problem identity');
       const cleaned = pickColumns(row, CONTEST_META_COLUMNS, { id, contest_id: contestId, problem_index: index });
       if (cleaned) counts.contestProblemsMeta = (counts.contestProblemsMeta || 0) + upsertRow('contest_problems_meta', CONTEST_META_COLUMNS, cleaned, 'id', false);
     }
@@ -454,66 +726,61 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
     for (const row of db.prepare('SELECT id, date FROM daily_sets WHERE profile_id = ?').all(profileId) as Array<{ id: string; date: string }>) {
       existingSetByDate.set(String(row.date), String(row.id));
     }
+    const dailySetIdMap = new Map<string, string>();
 
     for (const row of dailySets) {
-      const id = stringValue(row.id, 200);
+      const sourceId = stringValue(row.id, 200);
       const date = stringValue(row.date, 10);
-      if (
-        !id ||
-        !date ||
-        !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
-        !id.startsWith(`${profileId}_`) ||
-        !canWritePersonalRow('daily_sets', id, profileId)
-      ) {
-        skipped++;
-        continue;
-      }
+      if (!sourceId || !date) throw new Error('Backup contains an invalid daily set identity');
       const existingId = existingSetByDate.get(date);
       if (existingId) {
         availableSetIds.add(existingId);
+        dailySetIdMap.set(sourceId, existingId);
         continue;
       }
+      const id = `${profileId}_${date}`;
       const cleaned = pickColumns(row, PERSONAL_TABLES.dailySets.columns, {
         id,
-        profile_id: profileId,
+        profile_id: mappedProfileId,
         date,
       });
-      if (!cleaned) { skipped++; continue; }
       const changed = upsertRow('daily_sets', [...PERSONAL_TABLES.dailySets.columns], cleaned, 'id', false);
       counts.dailySets = (counts.dailySets || 0) + changed;
-      if (changed > 0) {
-        availableSetIds.add(id);
-        existingSetByDate.set(date, id);
-      }
+      availableSetIds.add(id);
+      existingSetByDate.set(date, id);
+      dailySetIdMap.set(sourceId, id);
     }
 
     const problemExists = (problemId: string): boolean => Boolean(
-      db.prepare('SELECT 1 FROM problems WHERE id = ?').get(problemId)
+      prepareCached('SELECT 1 FROM problems WHERE id = ?').get(problemId)
     );
+    const dailyProblemIdMap = new Map<string, string>();
 
     for (const row of dailyProblems) {
-      const id = stringValue(row.id, 200);
-      const setId = stringValue(row.daily_set_id, 200);
+      const sourceId = stringValue(row.id, 200);
+      const sourceSetId = stringValue(row.daily_set_id, 200);
       const problemId = stringValue(row.problem_id, 200);
-      if (
-        !id ||
-        !setId ||
-        !problemId ||
-        !id.startsWith(`${profileId}_`) ||
-        !availableSetIds.has(setId) ||
-        !problemExists(problemId) ||
-        !canWritePersonalRow('daily_problems', id, profileId)
-      ) {
-        skipped++;
-        continue;
+      const setId = sourceSetId ? dailySetIdMap.get(sourceSetId) : undefined;
+      if (!sourceId || !setId || !problemId) throw new Error('Backup contains a daily problem with an unresolved parent');
+      if (!availableSetIds.has(setId)) throw new Error('Backup daily problem references an unavailable destination set');
+      if (!problemExists(problemId)) throw new Error(`Backup daily problem references missing problem '${problemId}'`);
+      const existing = prepareCached(
+        'SELECT id FROM daily_problems WHERE daily_set_id = ? AND problem_id = ?'
+      ).get(setId, problemId) as { id: string } | undefined;
+      const category = stringValue(row.category, 100);
+      const id = existing?.id || (category
+        ? `${setId}_${category}`
+        : stableId('daily_problem', profileId, setId, problemId));
+      if (!canWritePersonalRow('daily_problems', id, profileId)) {
+        throw new Error('Backup daily problem identity conflicts with another profile');
       }
+      dailyProblemIdMap.set(sourceId, id);
       const cleaned = pickColumns(row, PERSONAL_TABLES.dailyProblems.columns, {
         id,
         daily_set_id: setId,
-        profile_id: profileId,
+        profile_id: mappedProfileId,
         problem_id: problemId,
       });
-      if (!cleaned) { skipped++; continue; }
       counts.dailyProblems = (counts.dailyProblems || 0) + upsertPersonalRow(
         'daily_problems',
         [...PERSONAL_TABLES.dailyProblems.columns],
@@ -524,15 +791,19 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
     }
 
     for (const row of reviewQueue) {
-      const id = stringValue(row.id, 300);
+      const sourceId = stringValue(row.id, 300);
       const problemId = stringValue(row.problem_id, 200);
-      if (!id || !problemId || !canWritePersonalRow('review_queue', id, profileId)) { skipped++; continue; }
+      if (!sourceId || !problemId) throw new Error('Backup contains an invalid review identity');
+      const existing = prepareCached(
+        'SELECT id FROM review_queue WHERE profile_id = ? AND problem_id = ?'
+      ).get(profileId, problemId) as { id: string } | undefined;
+      const id = existing?.id || stableId('review', profileId, problemId);
+      if (!canWritePersonalRow('review_queue', id, profileId)) throw new Error('Backup review identity conflicts with another profile');
       const cleaned = pickColumns(row, PERSONAL_TABLES.reviewQueue.columns, {
         id,
         profile_id: profileId,
         problem_id: problemId,
       });
-      if (!cleaned) { skipped++; continue; }
       counts.reviewQueue = (counts.reviewQueue || 0) + upsertPersonalRow(
         'review_queue',
         [...PERSONAL_TABLES.reviewQueue.columns],
@@ -542,16 +813,24 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
       );
     }
 
+    const solveSessionIdMap = new Map<string, string>();
     for (const row of solveSessions) {
-      const id = stringValue(row.id, 200);
+      const sourceId = stringValue(row.id, 200);
       const problemId = stringValue(row.problem_id, 200);
-      if (!id || !problemId || !canWritePersonalRow('solve_sessions', id, profileId)) { skipped++; continue; }
+      if (!sourceId || !problemId) throw new Error('Backup contains an invalid solve-session identity');
+      const sourceOwner = prepareCached('SELECT profile_id FROM solve_sessions WHERE id = ?').get(sourceId) as
+        | { profile_id: string }
+        | undefined;
+      const id = sourceProfileId === profileId && (!sourceOwner || sourceOwner.profile_id === profileId)
+        ? sourceId
+        : stableId('session', profileId, sourceProfileId, sourceId);
+      solveSessionIdMap.set(sourceId, id);
+      if (!canWritePersonalRow('solve_sessions', id, profileId)) throw new Error('Backup solve session identity conflicts with another profile');
       const cleaned = pickColumns(row, PERSONAL_TABLES.solveSessions.columns, {
         id,
-        profile_id: profileId,
+        profile_id: mappedProfileId,
         problem_id: problemId,
       });
-      if (!cleaned) { skipped++; continue; }
       counts.solveSessions = (counts.solveSessions || 0) + upsertPersonalRow(
         'solve_sessions',
         [...PERSONAL_TABLES.solveSessions.columns],
@@ -561,21 +840,24 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
       );
     }
 
+    const contestReviewIdMap = new Map<string, string>();
     for (const row of contestReviews) {
-      const id = stringValue(row.id, 300);
+      const sourceId = stringValue(row.id, 300);
       const contestId = numberValue(row.contest_id);
       const index = stringValue(row.problem_index, 50);
-      if (!id || contestId === null || !index || !canWritePersonalRow('contest_problem_reviews', id, profileId)) {
-        skipped++;
-        continue;
-      }
+      if (!sourceId || contestId === null || !index) throw new Error('Backup contains an invalid contest-review identity');
+      const existing = prepareCached(
+        'SELECT id FROM contest_problem_reviews WHERE profile_id = ? AND contest_id = ? AND problem_index = ?'
+      ).get(profileId, contestId, index) as { id: string } | undefined;
+      const id = existing?.id || stableId('contest_review', profileId, String(contestId), index);
+      contestReviewIdMap.set(sourceId, id);
+      if (!canWritePersonalRow('contest_problem_reviews', id, profileId)) throw new Error('Backup contest review identity conflicts with another profile');
       const cleaned = pickColumns(row, PERSONAL_TABLES.contestReviews.columns, {
         id,
-        profile_id: profileId,
+        profile_id: mappedProfileId,
         contest_id: contestId,
         problem_index: index,
       });
-      if (!cleaned) { skipped++; continue; }
       counts.contestReviews = (counts.contestReviews || 0) + upsertPersonalRow(
         'contest_problem_reviews',
         [...PERSONAL_TABLES.contestReviews.columns],
@@ -586,18 +868,19 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
     }
 
     for (const row of userContests) {
-      const id = stringValue(row.id, 300);
+      const sourceId = stringValue(row.id, 300);
       const contestId = numberValue(row.contest_id);
-      if (!id || contestId === null || !canWritePersonalRow('user_contests', id, profileId)) {
-        skipped++;
-        continue;
-      }
+      if (!sourceId || contestId === null) throw new Error('Backup contains an invalid user-contest identity');
+      const existing = prepareCached(
+        'SELECT id FROM user_contests WHERE profile_id = ? AND contest_id = ?'
+      ).get(profileId, contestId) as { id: string } | undefined;
+      const id = existing?.id || stableId('user_contest', profileId, String(contestId));
+      if (!canWritePersonalRow('user_contests', id, profileId)) throw new Error('Backup contest identity conflicts with another profile');
       const cleaned = pickColumns(row, PERSONAL_TABLES.userContests.columns, {
         id,
-        profile_id: profileId,
+        profile_id: mappedProfileId,
         contest_id: contestId,
       });
-      if (!cleaned) { skipped++; continue; }
       counts.userContests = (counts.userContests || 0) + upsertPersonalRow(
         'user_contests',
         [...PERSONAL_TABLES.userContests.columns],
@@ -608,18 +891,19 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
     }
 
     for (const row of weeklyGoals) {
-      const id = stringValue(row.id, 300);
+      const sourceId = stringValue(row.id, 300);
       const weekStart = stringValue(row.week_start_date, 10);
-      if (!id || !weekStart || !canWritePersonalRow('weekly_goals', id, profileId)) {
-        skipped++;
-        continue;
-      }
+      if (!sourceId || !weekStart) throw new Error('Backup contains an invalid weekly-goal identity');
+      const existing = prepareCached(
+        'SELECT id FROM weekly_goals WHERE profile_id = ? AND week_start_date = ?'
+      ).get(profileId, weekStart) as { id: string } | undefined;
+      const id = existing?.id || stableId('weekly_goal', profileId, weekStart);
+      if (!canWritePersonalRow('weekly_goals', id, profileId)) throw new Error('Backup weekly goal identity conflicts with another profile');
       const cleaned = pickColumns(row, PERSONAL_TABLES.weeklyGoals.columns, {
         id,
-        profile_id: profileId,
+        profile_id: mappedProfileId,
         week_start_date: weekStart,
       });
-      if (!cleaned) { skipped++; continue; }
       counts.weeklyGoals = (counts.weeklyGoals || 0) + upsertPersonalRow(
         'weekly_goals',
         [...PERSONAL_TABLES.weeklyGoals.columns],
@@ -630,29 +914,84 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
     }
 
     for (const row of learningEvents) {
-      const id = stringValue(row.id, 200);
+      const sourceId = stringValue(row.id, 200);
       const problemId = stringValue(row.problem_id, 200);
       const source = stringValue(row.source, 50);
-      if (!id || !problemId || !source) { skipped++; continue; }
+      if (!sourceId || !problemId || !source) throw new Error('Backup contains an invalid learning-event identity');
+      const originalSourceKey = stringValue(row.source_key, 500);
+      let relatedSourceKey = originalSourceKey;
+      if (originalSourceKey?.startsWith('daily_open_')) {
+        const sourceDailyProblemId = originalSourceKey.slice('daily_open_'.length);
+        const destinationDailyProblemId = dailyProblemIdMap.get(sourceDailyProblemId);
+        if (!destinationDailyProblemId) {
+          throw new Error('Backup learning event references a missing daily problem');
+        }
+        relatedSourceKey = `daily_open_${destinationDailyProblemId}`;
+      } else if (originalSourceKey?.startsWith('legacy_daily_')) {
+        const sourceDailyProblemId = originalSourceKey.slice('legacy_daily_'.length);
+        const destinationDailyProblemId = dailyProblemIdMap.get(sourceDailyProblemId);
+        if (!destinationDailyProblemId) {
+          throw new Error('Backup learning event references a missing legacy daily problem');
+        }
+        relatedSourceKey = `legacy_daily_${destinationDailyProblemId}`;
+      } else if (originalSourceKey?.startsWith('legacy_session_')) {
+        const sourceSessionId = originalSourceKey.slice('legacy_session_'.length);
+        const destinationSessionId = solveSessionIdMap.get(sourceSessionId);
+        if (!destinationSessionId) throw new Error('Backup learning event references a missing solve session');
+        relatedSourceKey = `legacy_session_${destinationSessionId}`;
+      } else if (originalSourceKey?.startsWith('legacy_contest_')) {
+        const sourceReviewId = originalSourceKey.slice('legacy_contest_'.length);
+        const destinationReviewId = contestReviewIdMap.get(sourceReviewId);
+        if (!destinationReviewId) throw new Error('Backup learning event references a missing contest review');
+        relatedSourceKey = `legacy_contest_${destinationReviewId}`;
+      }
+      const logicalIdentity = relatedSourceKey || sourceId;
+      const existingEventOwner = prepareCached(
+        'SELECT profile_id FROM problem_learning_events WHERE id = ?'
+      ).get(sourceId) as { profile_id: string } | undefined;
+      const id = sourceProfileId === profileId && (!existingEventOwner || existingEventOwner.profile_id === profileId)
+        ? sourceId
+        : stableId('learning_event', profileId, sourceProfileId, logicalIdentity);
+      const sourceKey = relatedSourceKey
+        ? sourceProfileId === profileId && originalSourceKey?.startsWith('restore_source_')
+          ? originalSourceKey
+          : remappedSourceKey(profileId, sourceProfileId, relatedSourceKey)
+        : null;
+      if (!canWritePersonalRow('problem_learning_events', id, profileId)) {
+        throw new Error('Backup learning-event identity conflicts with another profile');
+      }
       const cleaned = pickColumns(row, PERSONAL_TABLES.learningEvents.columns, {
         id,
-        profile_id: profileId,
+        profile_id: mappedProfileId,
         problem_id: problemId,
         source,
+        source_key: sourceKey,
       });
-      if (!cleaned) { skipped++; continue; }
-      const result = db.prepare(`
+      const result = prepareCached(`
         INSERT OR IGNORE INTO problem_learning_events (${PERSONAL_TABLES.learningEvents.columns.join(', ')})
         VALUES (${PERSONAL_TABLES.learningEvents.columns.map(() => '?').join(', ')})
       `).run(...PERSONAL_TABLES.learningEvents.columns.map((column) => sqlValue(cleaned[column])));
+      if (Number(result.changes || 0) === 0) {
+        const existingById = prepareCached(
+          'SELECT profile_id FROM problem_learning_events WHERE id = ?'
+        ).get(id) as { profile_id: string } | undefined;
+        const existingBySourceKey = sourceKey
+          ? prepareCached('SELECT profile_id FROM problem_learning_events WHERE source_key = ?').get(sourceKey) as
+              | { profile_id: string }
+              | undefined
+          : undefined;
+        if (existingById?.profile_id !== profileId && existingBySourceKey?.profile_id !== profileId) {
+          throw new Error('Backup learning-event source identity conflicts with another profile');
+        }
+      }
       counts.learningEvents = (counts.learningEvents || 0) + Number(result.changes || 0);
     }
 
     if (isRecord(raw.learnerState)) {
-      const dataJson = stringValue(raw.learnerState.data_json, 250000);
+      const dataJson = remapLearnerStateJson(raw.learnerState.data_json, sourceProfileId, profileId);
       const updatedAt = stringValue(raw.learnerState.updated_at, 40) || new Date().toISOString();
       if (dataJson) {
-        const result = db.prepare(`
+        const result = prepareCached(`
           INSERT INTO learner_profile_state (profile_id, handle, data_json, updated_at)
           VALUES (?, ?, ?, ?)
           ON CONFLICT(profile_id) DO UPDATE SET
@@ -660,7 +999,7 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
             data_json = excluded.data_json,
             updated_at = excluded.updated_at
           WHERE excluded.updated_at >= COALESCE(learner_profile_state.updated_at, '')
-        `).run(profileId, profile.handle, dataJson, updatedAt);
+        `).run(mappedProfileId, profile.handle, dataJson, updatedAt);
         counts.learnerState = Number(result.changes || 0);
       }
     }
@@ -691,5 +1030,5 @@ export function importPublicContext(profileId: string, raw: unknown): ImportCont
     throw err;
   }
 
-  return { imported: true, counts, skipped };
+  return { imported: true, counts, skipped, mode };
 }

@@ -106,6 +106,43 @@ export function initDatabase() {
       last_active_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS notification_settings (
+      profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+      contest_reminders INTEGER NOT NULL DEFAULT 0,
+      daily_reminders INTEGER NOT NULL DEFAULT 0,
+      reminder_time TEXT NOT NULL DEFAULT '20:00',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      endpoint_hash TEXT PRIMARY KEY,
+      profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+      owner_id TEXT NOT NULL,
+      endpoint TEXT NOT NULL,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_push_subscriptions_profile
+      ON push_subscriptions(profile_id);
+
+    CREATE TABLE IF NOT EXISTS notification_deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+      endpoint_hash TEXT NOT NULL,
+      notification_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
+      sent_at TEXT,
+      retry_after TEXT,
+      UNIQUE(profile_id, endpoint_hash, notification_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_notification_deliveries_retry
+      ON notification_deliveries(status, retry_after);
+
     CREATE TABLE IF NOT EXISTS profile_cache (
       handle TEXT PRIMARY KEY,
       rating INTEGER,
@@ -1094,4 +1131,3 @@ export function syncProfileVerifiedAC(profileId: string, handle: string): number
   const { verifiedCount } = syncProfileProblemStatuses(profileId, handle);
   return verifiedCount;
 }
-
