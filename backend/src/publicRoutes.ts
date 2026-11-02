@@ -8,6 +8,7 @@ import {
   getPublicProfileOwner,
 } from './db.js';
 import { codeforcesService } from './codeforcesService.js';
+import { codeforcesCacheService } from './codeforcesCacheService.js';
 import { exportPublicContext, importPublicContext } from './publicContextService.js';
 import { apiRouter } from './routes.js';
 import { notificationsService } from './notificationsService.js';
@@ -237,6 +238,7 @@ publicRouter.post('/profiles', rateLimit('profile-create', 8, 60_000), async (re
       validation.user.handle,
       displayName || validation.user.firstName || validation.user.handle
     );
+    codeforcesCacheService.cacheValidatedProfile(profile.id, validation.user);
     res.json({
       success: true,
       profile,

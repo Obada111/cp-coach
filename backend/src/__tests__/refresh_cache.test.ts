@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { db, initDatabase, createProfile, getProfileByHandle } from '../db.js';
 import { CodeforcesCacheService, codeforcesCacheService } from '../codeforcesCacheService.js';
 import { codeforcesService } from '../codeforcesService.js';
+import { contestService } from '../contestService.js';
 import { recommendationService } from '../recommendationService.js';
 
 describe('Codeforces Data Refresh & Cache Layer Audit Tests', () => {
@@ -142,6 +143,104 @@ describe('Codeforces Data Refresh & Cache Layer Audit Tests', () => {
     expect(db.prepare('SELECT COUNT(*) AS count FROM problems WHERE contest_id = 1700').get()).toEqual({ count: 2 });
 
     vi.restoreAllMocks();
+  });
+
+  it('uses the validated profile and prepares recommendations before noncritical rating refresh', async () => {
+    codeforcesCacheService.cacheValidatedProfile(testProfileId, {
+      handle: testHandle,
+      rating: 1350,
+      rank: 'pupil',
+    });
+
+    const userInfo = vi.spyOn(codeforcesService, 'getUserInfo').mockResolvedValue(null);
+    vi.spyOn(codeforcesService, 'getUserStatus').mockResolvedValue([{
+      id: 777002,
+      contestId: 1700,
+      creationTimeSeconds: 1700000000,
+      problem: {
+        contestId: 1700,
+        index: 'A',
+        name: 'Cached Profile Test',
+        rating: 1200,
+        tags: ['greedy'],
+      },
+      programmingLanguage: 'GNU C++',
+      verdict: 'OK',
+    }]);
+
+    let markRatingStarted!: () => void;
+    const ratingStarted = new Promise<void>((resolve) => {
+      markRatingStarted = resolve;
+    });
+    let releaseRating!: () => void;
+    const ratingGate = new Promise<void>((resolve) => {
+      releaseRating = resolve;
+    });
+    vi.spyOn(codeforcesService, 'getUserRating').mockImplementation(async () => {
+      markRatingStarted();
+      await ratingGate;
+      return [];
+    });
+    vi.spyOn(contestService, 'detectAndSyncContests').mockResolvedValue(undefined);
+    vi.spyOn(codeforcesService, 'getProblemset').mockResolvedValue({
+      problems: Array.from({ length: 100 }, (_, index) => ({
+        contestId: 1700 + index,
+        index: 'A',
+        name: `Problem ${index}`,
+        type: 'PROGRAMMING',
+        rating: 1000 + (index % 10) * 100,
+        tags: ['greedy'],
+      })),
+      problemStatistics: [],
+    });
+
+    const refresh = codeforcesCacheService.autoRefreshIfNeeded(testProfileId);
+    try {
+      await ratingStarted;
+      const readyStatus = codeforcesCacheService.getFreshnessStatus(testHandle, testProfileId);
+      expect(userInfo).not.toHaveBeenCalled();
+      expect(readyStatus.isSyncing).toBe(true);
+      expect(readyStatus.submissionsCount).toBeGreaterThan(0);
+      expect(readyStatus.problemsCount).toBeGreaterThanOrEqual(100);
+      expect(readyStatus.dataFreshness.isSubmissionsStale).toBe(false);
+      expect(readyStatus.dataFreshness.isProblemsetStale).toBe(false);
+    } finally {
+      releaseRating();
+      await refresh;
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('keeps an empty but freshly synchronized submission history fresh', async () => {
+    codeforcesCacheService.cacheValidatedProfile(testProfileId, {
+      handle: testHandle,
+      rating: 1350,
+    });
+    const userStatus = vi.spyOn(codeforcesService, 'getUserStatus').mockResolvedValue([]);
+    vi.spyOn(codeforcesService, 'getUserRating').mockResolvedValue([]);
+    vi.spyOn(codeforcesService, 'getProblemset').mockResolvedValue({
+      problems: Array.from({ length: 100 }, (_, index) => ({
+        contestId: 1800 + index,
+        index: 'A',
+        name: `Problem ${index}`,
+        type: 'PROGRAMMING',
+        rating: 1000 + (index % 10) * 100,
+        tags: ['greedy'],
+      })),
+      problemStatistics: [],
+    });
+    vi.spyOn(contestService, 'detectAndSyncContests').mockResolvedValue(undefined);
+
+    try {
+      await codeforcesCacheService.autoRefreshIfNeeded(testProfileId);
+      await codeforcesCacheService.autoRefreshIfNeeded(testProfileId);
+
+      expect(userStatus).toHaveBeenCalledTimes(1);
+      expect(codeforcesCacheService.getFreshnessStatus(testHandle, testProfileId)
+        .dataFreshness.isSubmissionsStale).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   // 2. In-flight request deduplication

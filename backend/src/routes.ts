@@ -249,7 +249,6 @@ apiRouter.get('/dashboard', async (req, res) => {
     const lastRefreshStartedAt = lastDashboardRefreshStartedAt.get(activeProfile.id) || 0;
     const shouldStartRefresh = !cachedStatus.isSyncing &&
       Date.now() - lastRefreshStartedAt >= DASHBOARD_REFRESH_COOLDOWN_MS && (
-        cachedStatus.submissionsCount === 0 ||
         cachedStatus.dataFreshness.isAnyStale
       );
     if (shouldStartRefresh) {
@@ -293,8 +292,6 @@ apiRouter.get('/dashboard', async (req, res) => {
       'SELECT 1 AS present FROM daily_sets WHERE profile_id = ? AND date = ?'
     ).get(activeProfile.id, date);
     const canGenerateDailySet = Boolean(existingSet) || (
-      !cachedStatus.isSyncing &&
-      cachedStatus.submissionsCount > 0 &&
       cachedStatus.problemsCount >= 100 &&
       !cachedStatus.dataFreshness.isSubmissionsStale &&
       !cachedStatus.dataFreshness.isProblemsetStale

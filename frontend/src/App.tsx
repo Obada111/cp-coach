@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState, useCallback, Suspense, lazy } from 'react';
+import React, { startTransition, useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import {
   fetchDashboard, fetchProfiles, createProfile as apiCreateProfile,
   selectProfile as apiSelectProfile, triggerSync, submitProblemFeedback, fetchHistory,
@@ -26,14 +26,29 @@ import { HistoryList } from './components/HistoryList';
 import { ProblemJournalList } from './components/ProblemJournalList';
 import { ReviewQueueCard } from './components/ReviewQueueCard';
 import { SolveSessionModal } from './components/SolveSessionModal';
+import { LazyFeatureBoundary, retryableLazy } from './components/RecoverableErrorBoundary';
 
-const LazyContestsView = lazy(() => import('./components/ContestsView').then((module) => ({ default: module.ContestsView })));
-const LazySkillTracksView = lazy(() => import('./components/SkillTracksView').then((module) => ({ default: module.SkillTracksView })));
-const LazyKnowledgeJournal = lazy(() => import('./components/KnowledgeJournal').then((module) => ({ default: module.KnowledgeJournal })));
-const LazyWeeklyCoachReport = lazy(() => import('./components/WeeklyCoachReport').then((module) => ({ default: module.WeeklyCoachReport })));
-const LazyNotificationsSettings = lazy(() => import('./components/NotificationsSettings').then((module) => ({ default: module.NotificationsSettings })));
-const LazyDataBackupPanel = lazy(() => import('./components/DataBackupPanel').then((module) => ({ default: module.DataBackupPanel })));
-const LazyGettingStartedHelp = lazy(() => import('./components/GettingStartedHelp').then((module) => ({ default: module.GettingStartedHelp })));
+const LazyContestsView = retryableLazy(async () => ({
+  default: (await import('./components/ContestsView')).ContestsView,
+}));
+const LazySkillTracksView = retryableLazy(async () => ({
+  default: (await import('./components/SkillTracksView')).SkillTracksView,
+}));
+const LazyKnowledgeJournal = retryableLazy(async () => ({
+  default: (await import('./components/KnowledgeJournal')).KnowledgeJournal,
+}));
+const LazyWeeklyCoachReport = retryableLazy(async () => ({
+  default: (await import('./components/WeeklyCoachReport')).WeeklyCoachReport,
+}));
+const LazyNotificationsSettings = retryableLazy(async () => ({
+  default: (await import('./components/NotificationsSettings')).NotificationsSettings,
+}));
+const LazyDataBackupPanel = retryableLazy(async () => ({
+  default: (await import('./components/DataBackupPanel')).DataBackupPanel,
+}));
+const LazyGettingStartedHelp = retryableLazy(async () => ({
+  default: (await import('./components/GettingStartedHelp')).GettingStartedHelp,
+}));
 import { getRankColor, formatDateHebron, formatRelativeTimeAgo } from './utils';
 import {
   RefreshCw, ChevronDown, Flame, TrendingUp, CheckCircle2,
@@ -102,6 +117,9 @@ export const App: React.FC = () => {
   const [activeSolveProblem, setActiveSolveProblem] = useState<DailyProblem | null>(null);
   const firstPaintMarkedRef = useRef(false);
   const dashboardReadyMarkedRef = useRef(false);
+  const navigateToTab = useCallback((nextTab: Tab) => {
+    startTransition(() => setTab(nextTab));
+  }, []);
 
   useLayoutEffect(() => {
     if (firstPaintMarkedRef.current) return;
@@ -188,12 +206,12 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     const handleNotificationNavigation = () => {
-      if (window.location.hash === '#daily-recommendations') setTab('home');
+      if (window.location.hash === '#daily-recommendations') navigateToTab('home');
     };
     window.addEventListener('hashchange', handleNotificationNavigation);
     handleNotificationNavigation();
     return () => window.removeEventListener('hashchange', handleNotificationNavigation);
-  }, []);
+  }, [navigateToTab]);
 
   useEffect(() => {
     if (tab !== 'home' || loading || window.location.hash !== '#daily-recommendations') return;
@@ -268,6 +286,7 @@ export const App: React.FC = () => {
         const dashboard = await fetchDashboard(profileId);
         perfMark('dashboard-request-end');
         perfMeasure('dashboard-request', 'dashboard-request-start', 'dashboard-request-end');
+        setRefreshNotice(null);
 
         // Dashboard data is the only essential payload. Make the app usable and
         // cache it immediately; history/journal/reviews are loaded afterwards so
@@ -292,7 +311,6 @@ export const App: React.FC = () => {
           reviewSummary: previousSnapshot?.reviewSummary ?? null,
           weeklyGoal: previousSnapshot?.weeklyGoal ?? null,
         });
-        setRefreshNotice(null);
         perfMark('app-usable');
         perfMeasure('navigation-to-app-usable', 'navigation-start', 'app-usable');
         if (isPublicMode) {
@@ -343,7 +361,7 @@ export const App: React.FC = () => {
       } catch (err: any) {
         const message = err.message || 'Cannot connect to backend';
         if (silent && dataRef.current) {
-          setRefreshNotice(message);
+          setRefreshNotice(`Refresh failed; showing the last successful data. ${message}`);
         } else if (!dataRef.current && restoreOfflineSnapshot('The service is unreachable.')) {
           return;
         } else {
@@ -850,7 +868,7 @@ export const App: React.FC = () => {
           ]).map((t) => (
             <button
               key={t.key}
-              onClick={() => setTab(t.key)}
+              onClick={() => navigateToTab(t.key)}
               aria-current={tab === t.key ? 'page' : undefined}
               className={`flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-medium border-b-2 transition-all whitespace-nowrap ${tab === t.key
                   ? 'border-cyan-500 text-white font-semibold'
@@ -882,13 +900,13 @@ export const App: React.FC = () => {
         {/* ──── HOME TAB ──── */}
         {tab === 'home' && (
           <div className="space-y-6">
-            <Suspense fallback={<div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 text-xs text-slate-300">Loading help…</div>}>
+            <LazyFeatureBoundary featureName="Getting Started Help" onReturnToTraining={() => navigateToTab('home')}>
               <LazyGettingStartedHelp />
-            </Suspense>
+            </LazyFeatureBoundary>
             {refreshNotice && (
               <div className="flex items-center gap-2 p-3 rounded-xl bg-slate-900/80 border border-slate-700/60 text-xs text-slate-400">
                 <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
-                <span>Auto-refresh failed; showing the last successful data. {refreshNotice}</span>
+                <span>{refreshNotice}</span>
               </div>
             )}
 
@@ -1086,7 +1104,7 @@ export const App: React.FC = () => {
                   </div>
                 </div>
                 <button
-                  onClick={() => setTab('reviews')}
+                  onClick={() => navigateToTab('reviews')}
                   className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition-all shrink-0 ml-3"
                 >
                   Review Now →
@@ -1137,9 +1155,9 @@ export const App: React.FC = () => {
               {/* Weekly Review Slide-down Card */}
               {showWeeklyReview && (
                 <>
-                <Suspense fallback={<div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 text-xs text-slate-300">Loading coach report…</div>}>
+                <LazyFeatureBoundary featureName="Weekly Coach Report" onReturnToTraining={() => navigateToTab('home')}>
                   <LazyWeeklyCoachReport profileId={data.activeProfile.id} />
-                </Suspense>
+                </LazyFeatureBoundary>
                 {data.learnerModel?.weeklyReview && (
                 <div className="mb-4 p-4 rounded-xl bg-slate-900/95 border border-slate-700/80 space-y-3 shadow-md">
                   <div className="flex items-center justify-between border-b border-slate-800 pb-2">
@@ -1248,7 +1266,7 @@ export const App: React.FC = () => {
                     <AlertCircle className="w-4 h-4 text-rose-400" />
                     Topics to Improve
                   </h2>
-                  <button onClick={() => setTab('topics')} className="text-[11px] text-cyan-400 hover:text-cyan-300">
+                  <button onClick={() => navigateToTab('topics')} className="text-[11px] text-cyan-400 hover:text-cyan-300">
                     View all →
                   </button>
                 </div>
@@ -1273,9 +1291,9 @@ export const App: React.FC = () => {
 
         {/* ──── MASTERY MAP TAB ──── */}
         {tab === 'skill-tracks' && (
-          <Suspense fallback={<div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 text-xs text-slate-300">Loading mastery map...</div>}>
+          <LazyFeatureBoundary featureName="Mastery Map" onReturnToTraining={() => navigateToTab('home')}>
             <LazySkillTracksView profileId={data.activeProfile.id} events={journal} />
-          </Suspense>
+          </LazyFeatureBoundary>
         )}
 
         {/* ──── REVIEWS TAB ──── */}
@@ -1320,21 +1338,21 @@ export const App: React.FC = () => {
 
         {/* ──── CONTESTS TAB ──── */}
         {tab === 'contests' && (
-          <Suspense fallback={<div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 text-xs text-slate-300">Loading contests...</div>}>
+          <LazyFeatureBoundary featureName="Contests" onReturnToTraining={() => navigateToTab('home')}>
             <LazyContestsView
               profileId={data.activeProfile.id}
-              onNavigateToPractice={() => setTab('home')}
+              onNavigateToPractice={() => navigateToTab('home')}
             />
-          </Suspense>
+          </LazyFeatureBoundary>
         )}
 
         {tab === 'journal' && (
-          <Suspense fallback={<div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 text-xs text-slate-300">Loading knowledge journal…</div>}>
+          <LazyFeatureBoundary featureName="Knowledge Journal" onReturnToTraining={() => navigateToTab('home')}>
             <LazyKnowledgeJournal
               handle={data.activeProfile.handle}
               weakTopics={data.topics.weak.map((topic) => topic.tag.toLowerCase())}
             />
-          </Suspense>
+          </LazyFeatureBoundary>
         )}
 
         {/* ──── TOPICS TAB ──── */}
@@ -1390,11 +1408,17 @@ export const App: React.FC = () => {
               )}
               {installError && <p className="text-xs text-rose-300" role="alert">{installError}</p>}
             </section>
-            <LazyDataBackupPanel
-              enabled={isPublicMode}
-              onImported={async () => { await loadAll(data.activeProfile.id); }}
-            />
-            <LazyNotificationsSettings profileId={data.activeProfile.id} />
+            <div className="space-y-6">
+              <LazyFeatureBoundary featureName="Learning Data Backup" onReturnToTraining={() => navigateToTab('home')}>
+                <LazyDataBackupPanel
+                  enabled={isPublicMode}
+                  onImported={async () => { await loadAll(data.activeProfile.id); }}
+                />
+              </LazyFeatureBoundary>
+              <LazyFeatureBoundary featureName="Notifications Settings" onReturnToTraining={() => navigateToTab('home')}>
+                <LazyNotificationsSettings profileId={data.activeProfile.id} />
+              </LazyFeatureBoundary>
+            </div>
 
             {/* Current profile info */}
             <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-3">

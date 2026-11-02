@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import { RecoverableErrorBoundary } from './components/RecoverableErrorBoundary';
 import { installPerf, perfMark, perfMarkNavigationStart } from './perf';
 import './index.css';
 
@@ -31,7 +32,9 @@ if (import.meta.env.PROD && 'serviceWorker' in navigator) {
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    <RecoverableErrorBoundary featureName="CP Coach">
+      <App />
+    </RecoverableErrorBoundary>
   </React.StrictMode>,
 );
 perfMark('render-requested');

@@ -1,7 +1,7 @@
 import { db, getProfileById, getProfileByHandle, updateProfileMeta, syncProfileVerifiedAC } from './db.js';
 import { codeforcesService } from './codeforcesService.js';
 import { contestService } from './contestService.js';
-import { SyncStatus } from './types.js';
+import { CFUser, SyncStatus } from './types.js';
 import { problemJournalService } from './problemJournalService.js';
 import { randomUUID } from 'node:crypto';
 import type { TimingSink } from './perf.js';
@@ -45,6 +45,50 @@ export class CodeforcesCacheService {
     if (!process.env.VITEST) {
       this.startBackgroundScheduler();
     }
+  }
+
+  cacheValidatedProfile(profileId: string, userInfo: CFUser): void {
+    this.storeProfileInfo(profileId, userInfo, new Date().toISOString());
+  }
+
+  private storeProfileInfo(profileId: string, userInfo: CFUser, refreshedAt: string): void {
+    db.prepare(`
+      INSERT INTO profile_cache (handle, rating, max_rating, rank, max_rank, avatar, title_photo, organization, city, country, raw_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(handle) DO UPDATE SET
+        rating = excluded.rating,
+        max_rating = excluded.max_rating,
+        rank = excluded.rank,
+        max_rank = excluded.max_rank,
+        avatar = excluded.avatar,
+        title_photo = excluded.title_photo,
+        organization = excluded.organization,
+        city = excluded.city,
+        country = excluded.country,
+        raw_json = excluded.raw_json,
+        updated_at = datetime('now')
+    `).run(
+      userInfo.handle,
+      userInfo.rating ?? null,
+      userInfo.maxRating ?? null,
+      userInfo.rank ?? null,
+      userInfo.maxRank ?? null,
+      userInfo.avatar ?? null,
+      userInfo.titlePhoto ?? null,
+      userInfo.organization ?? null,
+      userInfo.city ?? null,
+      userInfo.country ?? null,
+      JSON.stringify(userInfo)
+    );
+
+    updateProfileMeta(profileId, {
+      avatar: userInfo.avatar,
+      rating: userInfo.rating,
+      maxRating: userInfo.maxRating,
+      rank: userInfo.rank,
+      maxRank: userInfo.maxRank,
+    });
+    this.setMetaValue(`last_profile_refresh_${userInfo.handle.toLowerCase()}`, refreshedAt);
   }
 
   /**
@@ -253,7 +297,7 @@ export class CodeforcesCacheService {
     trace?.add('sync.freshness', performance.now() - freshnessStarted);
 
     // If everything is fresh and force is false, return immediately without network call
-    if (!force && !freshness.dataFreshness.isAnyStale && freshness.submissionsCount > 0) {
+    if (!force && !freshness.dataFreshness.isAnyStale) {
       return freshness;
     }
 
@@ -271,117 +315,96 @@ export class CodeforcesCacheService {
         const nowIso = new Date().toISOString();
 
         // 1. Refresh profile and submissions if stale or forced
-        const needSubs = force || freshness.dataFreshness.isSubmissionsStale || freshness.submissionsCount === 0;
-        if (needSubs) {
+        const needProfile = force || this.isStale(
+          this.getMetaTimestamp(`last_profile_refresh_${handleLower}`),
+          this.PROFILE_TTL_MS
+        );
+        const needSubs = force || this.isStale(
+          this.getMetaTimestamp(`last_submissions_refresh_${handleLower}`),
+          this.SUBMISSIONS_TTL_MS
+        );
+        if (needProfile || needSubs) {
           try {
-            // Fetch User Info
-            stageStarted = performance.now();
-            const userInfo = await codeforcesService.getUserInfo(handle);
-            trace?.add('sync.userInfo', performance.now() - stageStarted);
-            if (userInfo) {
-              db.prepare(`
-                INSERT INTO profile_cache (handle, rating, max_rating, rank, max_rank, avatar, title_photo, organization, city, country, raw_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                ON CONFLICT(handle) DO UPDATE SET
-                  rating = excluded.rating,
-                  max_rating = excluded.max_rating,
-                  rank = excluded.rank,
-                  max_rank = excluded.max_rank,
-                  avatar = excluded.avatar,
-                  title_photo = excluded.title_photo,
-                  organization = excluded.organization,
-                  city = excluded.city,
-                  country = excluded.country,
-                  raw_json = excluded.raw_json,
-                  updated_at = datetime('now')
-              `).run(
-                userInfo.handle,
-                userInfo.rating ?? null,
-                userInfo.maxRating ?? null,
-                userInfo.rank ?? null,
-                userInfo.maxRank ?? null,
-                userInfo.avatar ?? null,
-                userInfo.titlePhoto ?? null,
-                userInfo.organization ?? null,
-                userInfo.city ?? null,
-                userInfo.country ?? null,
-                JSON.stringify(userInfo)
-              );
-
-              updateProfileMeta(profileId, {
-                avatar: userInfo.avatar,
-                rating: userInfo.rating,
-                maxRating: userInfo.maxRating,
-                rank: userInfo.rank,
-                maxRank: userInfo.maxRank,
-              });
-              this.setMetaValue(`last_profile_refresh_${handleLower}`, nowIso);
+            if (needProfile) {
+              stageStarted = performance.now();
+              const userInfo = await codeforcesService.getUserInfo(handle);
+              trace?.add('sync.userInfo', performance.now() - stageStarted);
+              if (userInfo) this.storeProfileInfo(profileId, userInfo, nowIso);
             }
 
-            // Fetch Submissions: Full 4000 on first sync or force; recent 150 on incremental refresh
-            const subCount = freshness.submissionsCount;
-            const fetchCount = (force || subCount === 0) ? 4000 : 150;
-            stageStarted = performance.now();
-            const submissions = await codeforcesService.getUserStatus(handle, fetchCount);
-            trace?.add('sync.submissionsFetch', performance.now() - stageStarted);
-
-            if (submissions !== null) {
-              if (submissions.length > 0) {
+            if (needSubs) {
+              // Fetch 4000 submissions on first sync; incremental refreshes need only the latest 150.
+              const subCount = freshness.submissionsCount;
+              const fetchCount = (force || subCount === 0) ? 4000 : 150;
               stageStarted = performance.now();
-              const insertSub = db.prepare(`
+              const submissions = await codeforcesService.getUserStatus(handle, fetchCount);
+              trace?.add('sync.submissionsFetch', performance.now() - stageStarted);
+
+              if (submissions !== null) {
+                if (submissions.length > 0) {
+                  stageStarted = performance.now();
+                  const insertSub = db.prepare(`
                 INSERT OR REPLACE INTO submissions (id, handle, problem_id, contest_id, problem_index, verdict, creation_time, programming_language, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
               `);
 
-              db.exec('BEGIN TRANSACTION');
-              try {
-                for (const sub of submissions) {
-                  if (!sub.problem || !sub.problem.contestId || !sub.problem.index) continue;
-                  const problemId = `${sub.problem.contestId}_${sub.problem.index}`;
-                  insertSub.run(
-                    sub.id,
-                    handle,
-                    problemId,
-                    sub.problem.contestId,
-                    sub.problem.index,
-                    sub.verdict ?? 'UNKNOWN',
-                    sub.creationTimeSeconds,
-                    sub.programmingLanguage ?? '',
-                    JSON.stringify(sub)
-                  );
-                  if (sub.verdict === 'OK') {
-                    problemJournalService.record({
-                      profileId,
-                      problemId,
-                      source: 'VERIFIED_CODEFORCES',
-                      solvedStatus: 'VERIFIED_ACCEPTED',
-                      verifiedAc: true,
-                      sourceKey: `cf_submission_${sub.id}`,
-                      problemName: sub.problem.name,
-                      contestId: sub.problem.contestId,
-                      problemIndex: sub.problem.index,
-                      rating: sub.problem.rating ?? null,
-                      tags: sub.problem.tags || [],
-                    });
+                  db.exec('BEGIN TRANSACTION');
+                  try {
+                    for (const sub of submissions) {
+                      if (!sub.problem || !sub.problem.contestId || !sub.problem.index) continue;
+                      const problemId = `${sub.problem.contestId}_${sub.problem.index}`;
+                      insertSub.run(
+                        sub.id,
+                        handle,
+                        problemId,
+                        sub.problem.contestId,
+                        sub.problem.index,
+                        sub.verdict ?? 'UNKNOWN',
+                        sub.creationTimeSeconds,
+                        sub.programmingLanguage ?? '',
+                        JSON.stringify(sub)
+                      );
+                      if (sub.verdict === 'OK') {
+                        problemJournalService.record({
+                          profileId,
+                          problemId,
+                          source: 'VERIFIED_CODEFORCES',
+                          solvedStatus: 'VERIFIED_ACCEPTED',
+                          verifiedAc: true,
+                          sourceKey: `cf_submission_${sub.id}`,
+                          problemName: sub.problem.name,
+                          contestId: sub.problem.contestId,
+                          problemIndex: sub.problem.index,
+                          rating: sub.problem.rating ?? null,
+                          tags: sub.problem.tags || [],
+                        });
+                      }
+                    }
+                    db.exec('COMMIT');
+                  } catch (e) {
+                    try { db.exec('ROLLBACK'); } catch {}
+                    throw e;
                   }
-                }
-                db.exec('COMMIT');
-              } catch (e) {
-                try { db.exec('ROLLBACK'); } catch {}
-                throw e;
-              }
 
-              // Update verified ACs for active daily problems
-              syncProfileVerifiedAC(profileId, handle);
-              trace?.add('sync.submissionsWrite', performance.now() - stageStarted);
+                  syncProfileVerifiedAC(profileId, handle);
+                  trace?.add('sync.submissionsWrite', performance.now() - stageStarted);
+                }
+                this.setMetaValue(`last_submissions_refresh_${handleLower}`, nowIso);
               }
-              // An empty successful response is still a successful refresh.
-              this.setMetaValue(`last_submissions_refresh_${handleLower}`, nowIso);
             }
           } catch (subErr: any) {
             console.warn(`[CacheService] Submissions refresh error for ${handle}:`, subErr.message);
             syncError = subErr.message;
           }
+        }
+
+        try {
+          stageStarted = performance.now();
+          await this.refreshProblemsetIfNeeded(force, trace);
+          trace?.add('sync.problemset', performance.now() - stageStarted);
+        } catch (problemsetErr: any) {
+          console.warn('[CacheService] Problemset refresh error:', problemsetErr.message);
+          if (!syncError) syncError = problemsetErr.message;
         }
 
         // 2. Refresh rating history if stale or forced
@@ -447,18 +470,6 @@ export class CodeforcesCacheService {
             console.warn(`[CacheService] Contest refresh error for ${handle}:`, cErr.message);
             if (!syncError) syncError = cErr.message;
           }
-        }
-
-        // Keep the candidate pool current for recommendations. The refresh
-        // method uses its own global lease so multiple profiles/processes do
-        // not download or write the problemset concurrently.
-        try {
-          stageStarted = performance.now();
-          await this.refreshProblemsetIfNeeded(force, trace);
-          trace?.add('sync.problemset', performance.now() - stageStarted);
-        } catch (problemsetErr: any) {
-          console.warn('[CacheService] Problemset refresh error:', problemsetErr.message);
-          if (!syncError) syncError = problemsetErr.message;
         }
 
         // Record global and handle sync completion
