@@ -1,4 +1,4 @@
-import React, { startTransition, useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
+import React, { startTransition, useEffect, useLayoutEffect, useRef, useState, useCallback, lazy } from 'react';
 import {
   fetchDashboard, fetchProfiles, createProfile as apiCreateProfile,
   selectProfile as apiSelectProfile, triggerSync, submitProblemFeedback, fetchHistory,
@@ -26,29 +26,15 @@ import { HistoryList } from './components/HistoryList';
 import { ProblemJournalList } from './components/ProblemJournalList';
 import { ReviewQueueCard } from './components/ReviewQueueCard';
 import { SolveSessionModal } from './components/SolveSessionModal';
-import { LazyFeatureBoundary, retryableLazy } from './components/RecoverableErrorBoundary';
+import { LazyFeatureBoundary } from './components/RecoverableErrorBoundary';
 
-const LazyContestsView = retryableLazy(async () => ({
-  default: (await import('./components/ContestsView')).ContestsView,
-}));
-const LazySkillTracksView = retryableLazy(async () => ({
-  default: (await import('./components/SkillTracksView')).SkillTracksView,
-}));
-const LazyKnowledgeJournal = retryableLazy(async () => ({
-  default: (await import('./components/KnowledgeJournal')).KnowledgeJournal,
-}));
-const LazyWeeklyCoachReport = retryableLazy(async () => ({
-  default: (await import('./components/WeeklyCoachReport')).WeeklyCoachReport,
-}));
-const LazyNotificationsSettings = retryableLazy(async () => ({
-  default: (await import('./components/NotificationsSettings')).NotificationsSettings,
-}));
-const LazyDataBackupPanel = retryableLazy(async () => ({
-  default: (await import('./components/DataBackupPanel')).DataBackupPanel,
-}));
-const LazyGettingStartedHelp = retryableLazy(async () => ({
-  default: (await import('./components/GettingStartedHelp')).GettingStartedHelp,
-}));
+const LazyContestsView = lazy(() => import('./components/ContestsView').then((module) => ({ default: module.ContestsView })));
+const LazySkillTracksView = lazy(() => import('./components/SkillTracksView').then((module) => ({ default: module.SkillTracksView })));
+const LazyKnowledgeJournal = lazy(() => import('./components/KnowledgeJournal').then((module) => ({ default: module.KnowledgeJournal })));
+const LazyWeeklyCoachReport = lazy(() => import('./components/WeeklyCoachReport').then((module) => ({ default: module.WeeklyCoachReport })));
+const LazyNotificationsSettings = lazy(() => import('./components/NotificationsSettings').then((module) => ({ default: module.NotificationsSettings })));
+const LazyDataBackupPanel = lazy(() => import('./components/DataBackupPanel').then((module) => ({ default: module.DataBackupPanel })));
+const LazyGettingStartedHelp = lazy(() => import('./components/GettingStartedHelp').then((module) => ({ default: module.GettingStartedHelp })));
 import { getRankColor, formatDateHebron, formatRelativeTimeAgo } from './utils';
 import {
   RefreshCw, ChevronDown, Flame, TrendingUp, CheckCircle2,

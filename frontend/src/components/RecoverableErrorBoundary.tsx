@@ -1,21 +1,5 @@
 import React from 'react';
 
-const LazyRetryContext = React.createContext(0);
-
-export function retryableLazy<P extends object>(
-  load: () => Promise<{ default: React.ComponentType<P> }>,
-): React.FC<P> {
-  const RetryableLazy: React.FC<P> = (props) => {
-    const retryKey = React.useContext(LazyRetryContext);
-    const Component = React.useMemo(() => React.lazy(load), [retryKey]);
-    return React.createElement(
-      Component,
-      props as React.Attributes & React.ComponentProps<typeof Component>,
-    );
-  };
-  return RetryableLazy;
-}
-
 interface RecoverableErrorBoundaryProps {
   featureName: string;
   onReturnToTraining?: () => void;
@@ -24,17 +8,16 @@ interface RecoverableErrorBoundaryProps {
 
 interface RecoverableErrorBoundaryState {
   error: Error | null;
-  retryKey: number;
 }
 
 export class RecoverableErrorBoundary extends React.Component<
   RecoverableErrorBoundaryProps,
   RecoverableErrorBoundaryState
 > {
-  state: RecoverableErrorBoundaryState = { error: null, retryKey: 0 };
+  state: RecoverableErrorBoundaryState = { error: null };
 
   static getDerivedStateFromError(error: Error): RecoverableErrorBoundaryState {
-    return { error, retryKey: 0 };
+    return { error };
   }
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo): void {
@@ -42,7 +25,7 @@ export class RecoverableErrorBoundary extends React.Component<
   }
 
   private retry = (): void => {
-    this.setState((state) => ({ error: null, retryKey: state.retryKey + 1 }));
+    this.setState({ error: null });
   };
 
   render(): React.ReactNode {
@@ -54,14 +37,7 @@ export class RecoverableErrorBoundary extends React.Component<
             {this.state.error.message || 'An unexpected rendering error occurred.'}
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={this.retry}
-              className="rounded-lg bg-rose-900 px-3 py-2 text-xs font-semibold text-white hover:bg-rose-800"
-            >
-              Try again
-            </button>
-            {this.props.onReturnToTraining && (
+            {this.props.onReturnToTraining ? (
               <button
                 type="button"
                 onClick={this.props.onReturnToTraining}
@@ -69,17 +45,21 @@ export class RecoverableErrorBoundary extends React.Component<
               >
                 Return to Training Plan
               </button>
+            ) : (
+              <button
+                type="button"
+                onClick={this.retry}
+                className="rounded-lg bg-rose-900 px-3 py-2 text-xs font-semibold text-white hover:bg-rose-800"
+              >
+                Try again
+              </button>
             )}
           </div>
         </div>
       );
     }
 
-    return (
-      <LazyRetryContext.Provider value={this.state.retryKey}>
-        {this.props.children}
-      </LazyRetryContext.Provider>
-    );
+    return this.props.children;
   }
 }
 
