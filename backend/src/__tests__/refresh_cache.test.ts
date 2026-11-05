@@ -348,6 +348,8 @@ describe('Codeforces Data Refresh & Cache Layer Audit Tests', () => {
 
     // Mock CF API failure (e.g. HTTP 429 or network disconnect)
     vi.spyOn(codeforcesService, 'getUserInfo').mockRejectedValue(new Error('Codeforces API returned HTTP 429: Rate limit exceeded'));
+    vi.spyOn(codeforcesService, 'getUserRating').mockResolvedValue([]);
+    vi.spyOn(contestService, 'detectAndSyncContests').mockResolvedValue([]);
 
     // Trigger refresh: should not throw, should retain cached data
     const status = await codeforcesCacheService.autoRefreshIfNeeded(testProfileId, true);
@@ -400,6 +402,7 @@ describe('Codeforces Data Refresh & Cache Layer Audit Tests', () => {
     });
     vi.spyOn(codeforcesService, 'getUserStatus').mockResolvedValue([]);
     vi.spyOn(codeforcesService, 'getUserRating').mockResolvedValue([]);
+    vi.spyOn(contestService, 'detectAndSyncContests').mockResolvedValue([]);
 
     // Perform forced data refresh
     await codeforcesCacheService.autoRefreshIfNeeded(testProfileId, true);

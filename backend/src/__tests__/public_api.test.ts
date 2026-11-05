@@ -3,13 +3,15 @@ import { createHash } from 'node:crypto';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { db, getOrCreatePublicProfile, getPublicProfileId, initDatabase } from '../db.js';
+import { createProfile, db, getOrCreatePublicProfile, getPublicProfileId, initDatabase } from '../db.js';
 import { codeforcesService } from '../codeforcesService.js';
+import { cloudflareNotificationRepository } from '../cloudflareNotificationRepository.js';
 import { exportPublicContext, importPublicContext } from '../publicContextService.js';
 import { publicRouter } from '../publicRoutes.js';
 
-const CLIENT_A = 'clientA1234567890';
-const CLIENT_B = 'clientB1234567890';
+const USER_A = '11111111-1111-4111-8111-111111111111';
+const USER_B = '22222222-2222-4222-8222-222222222222';
+const USER_C = '33333333-3333-4333-8333-333333333333';
 const HANDLE = 'PublicTestUser';
 
 let server: Server;
@@ -32,9 +34,24 @@ async function request(path: string, init: RequestInit = {}) {
   return { status: response.status, body, headers: response.headers };
 }
 
-function headers(clientId: string, handle = HANDLE): Record<string, string> {
+function makeToken(userId: string, expiresInSeconds = 3600): string {
+  const encode = (value: Record<string, unknown>) =>
+    Buffer.from(JSON.stringify(value)).toString('base64url');
+  return [
+    encode({ alg: 'none', typ: 'JWT' }),
+    encode({
+      sub: userId,
+      role: 'authenticated',
+      aud: 'authenticated',
+      exp: Math.floor(Date.now() / 1000) + expiresInSeconds,
+    }),
+    'test-signature',
+  ].join('.');
+}
+
+function headers(userId: string, handle = HANDLE): Record<string, string> {
   return {
-    'X-Coach-Client-Id': clientId,
+    Authorization: `Bearer ${makeToken(userId)}`,
     'X-Coach-Handle': handle,
     'Content-Type': 'application/json',
   };
@@ -115,8 +132,8 @@ beforeAll(async () => {
   server.keepAliveTimeout = 60000;
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
-  profileA = getOrCreatePublicProfile(CLIENT_A, HANDLE);
-  profileB = getOrCreatePublicProfile(CLIENT_B, HANDLE);
+  profileA = getOrCreatePublicProfile(USER_A, HANDLE);
+  profileB = getOrCreatePublicProfile(USER_B, HANDLE);
 });
 
 afterAll(async () => {
@@ -128,18 +145,79 @@ afterAll(async () => {
 });
 
 describe('public API tenant isolation', () => {
+  it('only reports push as ready after the scheduled Worker has succeeded recently', async () => {
+    const original = {
+      publicMode: process.env.PUBLIC_MODE,
+      workerUrl: process.env.CLOUDFLARE_NOTIFICATIONS_URL,
+      workerSecret: process.env.CLOUDFLARE_NOTIFICATIONS_API_SECRET,
+      vapidPublicKey: process.env.VAPID_PUBLIC_KEY,
+    };
+    process.env.PUBLIC_MODE = 'true';
+    process.env.CLOUDFLARE_NOTIFICATIONS_URL = 'http://127.0.0.1:8787';
+    process.env.CLOUDFLARE_NOTIFICATIONS_API_SECRET = 'test-secret';
+    process.env.VAPID_PUBLIC_KEY = 'test-public-key';
+    const isConfigured = vi.spyOn(cloudflareNotificationRepository, 'isConfigured').mockReturnValue(true);
+    const getHealth = vi.spyOn(cloudflareNotificationRepository, 'getHealth');
+    const healthyWorker = {
+      status: 'ok',
+      storageReady: true,
+      apiSecretConfigured: true,
+      vapidConfigured: true,
+      vapidPublicKey: 'test-public-key',
+      state: { last_status: 'FAILED', last_success_at: null },
+      latestRun: { status: 'FAILED', pushes_attempted: 1, notifications_sent: 0 },
+      schedulerHealthy: false,
+    };
+    try {
+      getHealth.mockResolvedValueOnce(healthyWorker).mockResolvedValueOnce({
+        ...healthyWorker,
+        state: { last_status: 'SUCCEEDED', last_success_at: new Date().toISOString() },
+        latestRun: { status: 'SUCCEEDED', pushes_attempted: 1, notifications_sent: 1 },
+        schedulerHealthy: true,
+      });
+
+      const stale = await request('/api/public/notifications/config', {
+        headers: headers(USER_A),
+      });
+      expect(stale.status).toBe(200);
+      expect(stale.body.available).toBe(false);
+      expect(stale.body.readiness.worker.schedulerHealthy).toBe(false);
+      expect(stale.body.readiness.worker.lastRun.notifications_sent).toBe(0);
+
+      const ready = await request('/api/public/notifications/config', {
+        headers: headers(USER_A),
+      });
+      expect(ready.status).toBe(200);
+      expect(ready.body.available).toBe(true);
+      expect(ready.body.readiness.worker.schedulerHealthy).toBe(true);
+      expect(ready.body.readiness.worker.lastRun.notifications_sent).toBe(1);
+    } finally {
+      isConfigured.mockRestore();
+      getHealth.mockRestore();
+      for (const [key, value] of Object.entries({
+        PUBLIC_MODE: original.publicMode,
+        CLOUDFLARE_NOTIFICATIONS_URL: original.workerUrl,
+        CLOUDFLARE_NOTIFICATIONS_API_SECRET: original.workerSecret,
+        VAPID_PUBLIC_KEY: original.vapidPublicKey,
+      })) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it('gives the same handle different deterministic profiles per browser', () => {
     expect(profileA.id).not.toBe(profileB.id);
-    expect(profileA.id).toBe(getPublicProfileId(CLIENT_A, HANDLE));
-    expect(profileB.id).toBe(getPublicProfileId(CLIENT_B, HANDLE));
+    expect(profileA.id).toBe(getPublicProfileId(USER_A, HANDLE));
+    expect(profileB.id).toBe(getPublicProfileId(USER_B, HANDLE));
   });
 
   it('lists only the requesting browser profiles', async () => {
-    const a = await request('/api/public/profiles', { headers: headers(CLIENT_A) });
+    const a = await request('/api/public/profiles', { headers: headers(USER_A) });
     expect(a.status).toBe(200);
     expect(a.body.profiles.map((profile: any) => profile.id)).toEqual([profileA.id]);
 
-    const b = await request('/api/public/profiles', { headers: headers(CLIENT_B) });
+    const b = await request('/api/public/profiles', { headers: headers(USER_B) });
     expect(b.status).toBe(200);
     expect(b.body.profiles.map((profile: any) => profile.id)).toEqual([profileB.id]);
   });
@@ -152,7 +230,7 @@ describe('public API tenant isolation', () => {
     try {
       const missing = await request('/api/public/profiles', {
         method: 'POST',
-        headers: headers('missingHandleClient123'),
+        headers: headers(USER_C),
         body: JSON.stringify({ handle: 'MissingUser' }),
       });
       expect(missing.status).toBe(400);
@@ -160,7 +238,7 @@ describe('public API tenant isolation', () => {
 
       const unavailable = await request('/api/public/profiles', {
         method: 'POST',
-        headers: headers('unavailableHandleClient'),
+        headers: headers(USER_C),
         body: JSON.stringify({ handle: 'ValidShape' }),
       });
       expect(unavailable.status).toBe(503);
@@ -174,7 +252,7 @@ describe('public API tenant isolation', () => {
     const snapshot = makeContext(profileA, 'private note A');
     const imported = await request('/api/public/context', {
       method: 'POST',
-      headers: headers(CLIENT_A),
+      headers: headers(USER_A),
       body: JSON.stringify({ context: snapshot }),
     });
     expect(imported.status).toBe(200);
@@ -182,11 +260,11 @@ describe('public API tenant isolation', () => {
     expect(imported.body.counts.dailySets).toBe(1);
     expect(imported.body.counts.dailyProblems).toBe(1);
 
-    const aContext = await request('/api/public/context', { headers: headers(CLIENT_A) });
+    const aContext = await request('/api/public/context', { headers: headers(USER_A) });
     expect(aContext.status).toBe(200);
     expect(aContext.body.dailyProblems[0].notes).toBe('private note A');
 
-    const bContext = await request('/api/public/context', { headers: headers(CLIENT_B) });
+    const bContext = await request('/api/public/context', { headers: headers(USER_B) });
     expect(bContext.status).toBe(200);
     expect(bContext.body.dailyProblems).toHaveLength(0);
   });
@@ -213,7 +291,7 @@ describe('public API tenant isolation', () => {
       const imported = await Promise.race([
         request('/api/public/context', {
           method: 'POST',
-          headers: headers(CLIENT_A),
+          headers: headers(USER_A),
           body: JSON.stringify({ context: makeContext(profileA, 'sync after response') }),
         }),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 1000)),
@@ -263,13 +341,13 @@ describe('public API tenant isolation', () => {
     updated.dailyProblems[0].updated_at = '2026-01-02T00:00:00.000Z';
     const imported = await request('/api/public/context', {
       method: 'POST',
-      headers: headers(CLIENT_A),
+      headers: headers(USER_A),
       body: JSON.stringify({ context: updated }),
     });
     expect(imported.status).toBe(200);
     expect(imported.body.counts.dailyProblems).toBe(1);
 
-    const aContext = await request('/api/public/context', { headers: headers(CLIENT_A) });
+    const aContext = await request('/api/public/context', { headers: headers(USER_A) });
     expect(aContext.body.dailyProblems[0].notes).toBe('updated note A');
   });
 
@@ -295,7 +373,7 @@ describe('public API tenant isolation', () => {
 
     const imported = await request('/api/public/context', {
       method: 'POST',
-      headers: headers(CLIENT_B),
+      headers: headers(USER_B),
       body: JSON.stringify({ context: snapshot }),
     });
     expect(imported.status).toBe(200);
@@ -326,7 +404,7 @@ describe('public API tenant isolation', () => {
     ] as any;
     const firstImport = await request('/api/public/context', {
       method: 'POST',
-      headers: headers(CLIENT_A),
+      headers: headers(USER_A),
       body: JSON.stringify({ context: first }),
     });
     expect(firstImport.status).toBe(200);
@@ -346,7 +424,7 @@ describe('public API tenant isolation', () => {
     ] as any;
     const secondImport = await request('/api/public/context', {
       method: 'POST',
-      headers: headers(CLIENT_A),
+      headers: headers(USER_A),
       body: JSON.stringify({ context: second }),
     });
     expect(secondImport.status).toBe(200);
@@ -365,7 +443,7 @@ describe('public API tenant isolation', () => {
     ).get(profileA.id, '2026-01-01') as { id: string }).id;
     const badFeedback = await request(`/api/public/problems/${encodeURIComponent(dailyProblemId)}/feedback`, {
       method: 'POST',
-      headers: headers(CLIENT_A),
+      headers: headers(USER_A),
       body: JSON.stringify({ solvedStatus: 'MADE_UP_STATUS' }),
     });
     expect(badFeedback.status).toBe(400);
@@ -373,7 +451,7 @@ describe('public API tenant isolation', () => {
 
     const badReview = await request('/api/public/reviews/1_A/action', {
       method: 'POST',
-      headers: headers(CLIENT_A),
+      headers: headers(USER_A),
       body: JSON.stringify({ outcome: 'MADE_UP_OUTCOME' }),
     });
     expect(badReview.status).toBe(400);
@@ -385,7 +463,7 @@ describe('public API tenant isolation', () => {
     foreign.handle = 'SomeOtherHandle';
     const imported = await request('/api/public/context', {
       method: 'POST',
-      headers: headers(CLIENT_A),
+      headers: headers(USER_A),
       body: JSON.stringify({ context: foreign, mode: 'merge' }),
     });
     expect(imported.status).toBe(400);
@@ -408,13 +486,13 @@ describe('public API tenant isolation', () => {
 
     const imported = await request('/api/public/context', {
       method: 'POST',
-      headers: headers(CLIENT_A),
+      headers: headers(USER_A),
       body: JSON.stringify({ context: replacement, mode: 'replace' }),
     });
     expect(imported.status).toBe(200);
     expect(imported.body.mode).toBe('replace');
 
-    const aContext = await request('/api/public/context', { headers: headers(CLIENT_A) });
+    const aContext = await request('/api/public/context', { headers: headers(USER_A) });
     expect(aContext.body.dailySets).toHaveLength(1);
     expect(aContext.body.dailySets[0].date).toBe('2026-02-01');
     expect(aContext.body.dailyProblems[0].notes).toBe('replacement note');
@@ -584,16 +662,71 @@ describe('public API tenant isolation', () => {
     expect(db.prepare('SELECT COUNT(*) AS count FROM problem_learning_events WHERE profile_id = ?').get(destination.id)).toMatchObject({ count: 505 });
   }, 60000);
 
-  it('requires both a client id and a handle for personal routes', async () => {
-    const missingClient = await request('/api/public/context', {
+  it('rejects unauthenticated, expired, and cross-account profile access', async () => {
+    const missingAuth = await request('/api/public/context', {
       headers: { 'X-Coach-Handle': HANDLE },
     });
-    expect(missingClient.status).toBe(400);
+    expect(missingAuth.status).toBe(401);
 
-    const missingHandle = await request('/api/public/context', {
-      headers: { 'X-Coach-Client-Id': CLIENT_A },
+    const spoofedClientId = await request('/api/public/context', {
+      headers: { 'X-Coach-Client-Id': USER_A, 'X-Coach-Handle': HANDLE },
     });
-    expect(missingHandle.status).toBe(400);
+    expect(spoofedClientId.status).toBe(401);
+
+    const expired = await request('/api/public/context', {
+      headers: { Authorization: `Bearer ${makeToken(USER_A, -60)}` },
+    });
+    expect(expired.status).toBe(401);
+
+    const crossAccount = await request(`/api/public/context?profileId=${encodeURIComponent(profileA.id)}`, {
+      headers: headers(USER_B),
+    });
+    expect(crossAccount.status).toBe(403);
+  });
+
+  it('claims a legacy profile only for the authenticated user, with a safe dry-run', async () => {
+    const legacy = createProfile('PublicLegacyClaim');
+    db.prepare(`
+      INSERT INTO daily_sets (id, profile_id, date, generated_at)
+      VALUES (?, ?, '2026-04-03', '2026-04-03T00:00:00.000Z')
+    `).run(`${legacy.id}_2026-04-03`, legacy.id);
+
+    const denied = await request('/api/public/profiles/claim-legacy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle: 'PublicLegacyClaim', dryRun: true }),
+    });
+    expect(denied.status).toBe(401);
+
+    const unverified = await request('/api/public/profiles/claim-legacy', {
+      method: 'POST',
+      headers: headers(USER_C, 'PublicLegacyClaim'),
+      body: JSON.stringify({ profileId: legacy.id, dryRun: true }),
+    });
+    expect(unverified.status).toBe(403);
+
+    const preview = await request('/api/public/profiles/claim-legacy', {
+      method: 'POST',
+      headers: headers(USER_C, 'PublicLegacyClaim'),
+      body: JSON.stringify({
+        profileId: legacy.id,
+        dryRun: true,
+        claimSecret: 'test-migration-secret',
+      }),
+    });
+    expect(preview.status).toBe(200);
+    expect(preview.body.dryRun).toBe(true);
+    expect(preview.body.profile.ownerId).toBeNull();
+    expect(preview.body.migratedCounts.daily_sets).toBe(1);
+
+    const claimed = await request('/api/public/profiles/claim-legacy', {
+      method: 'POST',
+      headers: headers(USER_C, 'PublicLegacyClaim'),
+      body: JSON.stringify({ profileId: legacy.id, claimSecret: 'test-migration-secret' }),
+    });
+    expect(claimed.status).toBe(200);
+    expect(claimed.body.profile.ownerId).toBe(USER_C);
+    expect(claimed.body.migrationId).toMatch(/^pom_/);
   });
 
   it('reports a stable instance id for restart detection', async () => {

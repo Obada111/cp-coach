@@ -149,11 +149,19 @@ export const Onboarding: React.FC<OnboardingProps> = ({
         <div className="text-center text-[11px] text-slate-500 leading-relaxed space-y-1">
           <p>
             {isPublicMode
-              ? 'Your learning history is saved in this browser and a temporary service cache. It does not sync to other devices.'
+              ? 'Your training data is stored under your signed-in account and is available when you sign in on another device.'
               : 'Your training data stays on this computer.'}
           </p>
-          <p>Clearing browser data can erase your notes and feedback. Export a backup in Settings before clearing it.</p>
-          <p>No account or password is required. Browser separation is for convenience, not account-level security.</p>
+          <p>
+            {isPublicMode
+              ? 'You can still export a backup in Settings at any time.'
+              : 'Clearing browser data can erase your notes and feedback. Export a backup in Settings before clearing it.'}
+          </p>
+          <p>
+            {isPublicMode
+              ? 'Sign-in uses a passwordless email link. We never ask for or store your Codeforces password.'
+              : 'No account or password is required. Browser separation is for convenience, not account-level security.'}
+          </p>
         </div>
       </div>
     </div>

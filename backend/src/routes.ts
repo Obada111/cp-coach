@@ -25,7 +25,7 @@ import { problemJournalService } from './problemJournalService.js';
 import { exportPublicContext, importPublicContext } from './publicContextService.js';
 import { weeklyReportService } from './weeklyReportService.js';
 import { notificationsService } from './notificationsService.js';
-import { DashboardOverview } from './types.js';
+import { DashboardOverview, UserProfile } from './types.js';
 import { PerfTrace, attachServerTiming } from './perf.js';
 
 export const apiRouter = Router();
@@ -98,6 +98,49 @@ function optionalMinutes(value: unknown): number | null {
   return parsed;
 }
 
+export function resolveTargetProfile(req: any): { id: string; profile: UserProfile } {
+  if (req.publicProfile) {
+    return { id: req.publicProfile.id, profile: req.publicProfile };
+  }
+
+  const publicClientId = req.publicClientId as string | undefined;
+  const requestedId = String(req.query?.profileId || req.body?.profileId || '').trim();
+
+  if (requestedId) {
+    const p = getProfileById(requestedId);
+    if (!p) {
+      const err = new Error('Profile not found');
+      (err as any).statusCode = 404;
+      throw err;
+    }
+    if (publicClientId && (!p.ownerId || p.ownerId.toLowerCase() !== publicClientId.toLowerCase())) {
+      const err = new Error('Forbidden: You do not have permission to access this profile');
+      (err as any).statusCode = 403;
+      throw err;
+    }
+    return { id: p.id, profile: p };
+  }
+
+  if (publicClientId) {
+    const owned = getProfilesForOwner(publicClientId);
+    if (owned.length > 0) return { id: owned[0].id, profile: owned[0] };
+    const err = new Error('No profile found for this account');
+    (err as any).statusCode = 404;
+    throw err;
+  }
+
+  const defaultId = getActiveProfileId();
+  const def = getProfileById(defaultId);
+  if (!def) {
+    const all = getAllProfiles();
+    if (all.length > 0) return { id: all[0].id, profile: all[0] };
+    const err = new Error('Profile not found');
+    (err as any).statusCode = 404;
+    throw err;
+  }
+  return { id: def.id, profile: def };
+}
+
 // ==========================================
 // 1. Profiles API (Multi-Profile Support)
 // ==========================================
@@ -105,8 +148,9 @@ function optionalMinutes(value: unknown): number | null {
 // Get all profiles + current active profile
 apiRouter.get('/profiles', (req, res) => {
   try {
-    const profiles = getAllProfiles();
-    const activeProfileId = getActiveProfileId();
+    const publicClientId = (req as any).publicClientId as string | undefined;
+    const profiles = publicClientId ? getProfilesForOwner(publicClientId) : getAllProfiles();
+    const activeProfileId = profiles[0]?.id || getActiveProfileId();
     res.json({ profiles, activeProfileId });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to retrieve profiles', message: err.message });
@@ -214,24 +258,18 @@ apiRouter.get('/dashboard', async (req, res) => {
   });
   try {
     trace.start('dashboard.profile');
-    const profileIdQuery = req.query.profileId as string | undefined;
-    const activeId = profileIdQuery || getActiveProfileId();
-    let activeProfile = getProfileById(activeId);
-
-    if (!activeProfile) {
-      const all = getAllProfiles();
-      activeProfile = all[0];
-      if (activeProfile) setActiveProfileId(activeProfile.id);
-    }
-
-    if (!activeProfile) {
-      return res.status(404).json({ error: 'No profiles available' });
+    let activeProfile: UserProfile;
+    try {
+      const resolved = resolveTargetProfile(req);
+      activeProfile = resolved.profile;
+    } catch (profileErr: any) {
+      return res.status(profileErr.statusCode || 500).json({ error: profileErr.message || 'Profile access error' });
     }
 
     const publicClientId = (req as any).publicClientId as string | undefined;
     const availableProfiles = publicClientId
       ? getProfilesForOwner(publicClientId)
-      : getAllProfiles();
+      : (activeProfile.ownerId ? getProfilesForOwner(activeProfile.ownerId) : getAllProfiles());
     const handle = activeProfile.handle;
     trace.end('dashboard.profile');
 
@@ -1153,6 +1191,7 @@ apiRouter.put('/notifications/settings', (req, res) => {
     if (!getProfileById(profileId)) return res.status(404).json({ error: 'Profile not found' });
     const settings = notificationsService.updateSettings(profileId, {
       contestReminders: req.body?.contestReminders,
+      contestReminderOffsets: req.body?.contestReminderOffsets ?? [30],
       dailyReminders: req.body?.dailyReminders,
       reminderTime: req.body?.reminderTime,
     });
@@ -1161,6 +1200,7 @@ apiRouter.put('/notifications/settings', (req, res) => {
     const expected = new Set([
       'Reminder time must use 24-hour HH:mm format',
       'Reminder settings must be boolean values',
+      'Contest reminder offsets are invalid',
     ]);
     if (expected.has(err?.message)) return res.status(400).json({ error: err.message });
     console.error('Failed to update notification settings:', err);

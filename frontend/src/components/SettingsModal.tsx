@@ -1,4 +1,4 @@
-﻿import React, { useState } from 'react';
+import React, { useState } from 'react';
 import { 
   Settings, 
   Save, 
@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { SyncStatus } from '../types';
 import { formatDateHebron } from '../utils';
+import { isPublicMode } from '../api';
 
 interface SettingsModalProps {
   currentHandle: string;
@@ -153,9 +154,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <span>Privacy & Local Storage Architecture</span>
         </div>
         <p className="text-xs text-slate-400 leading-relaxed">
-          This application keeps personal training data in your browser and an ephemeral server cache.
-          Local mode can also use a SQLite file on your computer.
-          It uses only the public Codeforces API and never requires, asks for, or stores passwords.
+          {isPublicMode
+            ? 'In online mode, personal training data is stored under your signed-in account on the server, with verified backups. Local browser storage is only a cache and drafts. The server never asks for or stores your Codeforces password.'
+            : 'Local mode keeps training data in a SQLite file on this computer. It uses only the public Codeforces API and never requires, asks for, or stores passwords.'}
         </p>
       </div>
     </div>

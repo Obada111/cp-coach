@@ -1,4 +1,7 @@
 export const NOTIFICATION_TIMEZONE = 'Asia/Hebron';
+export const CONTEST_REMINDER_OFFSETS_MINUTES = [1440, 60, 30, 5] as const;
+export type ContestReminderOffsetMinutes = typeof CONTEST_REMINDER_OFFSETS_MINUTES[number];
+const CONTEST_REMINDER_OFFSET_SET = new Set<number>(CONTEST_REMINDER_OFFSETS_MINUTES);
 
 export interface DailySnapshotProblem {
   contestId: number;
@@ -86,6 +89,35 @@ export function isValidHandle(handle: unknown): handle is string {
 
 export function isValidReminderTime(value: unknown): value is string {
   return typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+export function parseContestReminderOffsets(value: unknown): ContestReminderOffsetMinutes[] | null {
+  let offsets = value;
+  if (typeof offsets === 'string') {
+    try {
+      offsets = JSON.parse(offsets);
+    } catch {
+      return null;
+    }
+  }
+  if (
+    !Array.isArray(offsets) ||
+    offsets.length > CONTEST_REMINDER_OFFSETS_MINUTES.length ||
+    offsets.some((offset) => !Number.isSafeInteger(offset) || !CONTEST_REMINDER_OFFSET_SET.has(offset)) ||
+    new Set(offsets).size !== offsets.length
+  ) return null;
+  return [...offsets].sort((left: number, right: number) => right - left) as ContestReminderOffsetMinutes[];
+}
+
+export function isContestReminderOffset(value: unknown): value is ContestReminderOffsetMinutes {
+  return Number.isSafeInteger(value) &&
+    CONTEST_REMINDER_OFFSETS_MINUTES.includes(value as ContestReminderOffsetMinutes);
+}
+
+export function formatContestReminderLead(offsetMinutes: ContestReminderOffsetMinutes): string {
+  if (offsetMinutes === 1440) return 'in 24 hours';
+  if (offsetMinutes === 60) return 'in 1 hour';
+  return `in ${offsetMinutes} minutes`;
 }
 
 export function isValidSubscription(value: unknown): value is {

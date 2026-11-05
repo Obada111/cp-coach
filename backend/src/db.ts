@@ -1,5 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import os from 'node:os';
+import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
 import { UserProfile, CurriculumProblem, LearnerModel } from './types.js';
@@ -7,10 +9,40 @@ import { VERIFIED_CURRICULUM_PROBLEMS } from './curriculumData.js';
 
 import { fileURLToPath } from 'url';
 
+dotenv.config();
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+export function isEphemeralStoragePath(dirPath: string): boolean {
+  const normalized = path.normalize(dirPath).toLowerCase();
+  const tmp = os.tmpdir().toLowerCase();
+  return (
+    normalized === '/tmp' ||
+    normalized.startsWith('/tmp/') ||
+    normalized.startsWith('\\tmp') ||
+    normalized.startsWith('/tmp\\') ||
+    normalized.includes('/tmp/') ||
+    normalized.includes('\\tmp\\') ||
+    normalized === tmp ||
+    normalized.startsWith(tmp + path.sep)
+  );
+}
+
 const DB_DIR = process.env.DB_DIR || path.resolve(__dirname, '../data');
+
+if (
+  process.env.NODE_ENV === 'production' &&
+  isEphemeralStoragePath(DB_DIR) &&
+  process.env.ALLOW_EPHEMERAL_DB_FOR_TESTS !== 'true' &&
+  process.env.ALLOW_EPHEMERAL_DB_CACHE !== 'true' &&
+  !process.env.DATABASE_URL?.trim()
+) {
+  throw new Error(
+    `[Database Configuration Error] Ephemeral storage path ('${DB_DIR}') without durable cloud database backing (DATABASE_URL or ALLOW_EPHEMERAL_DB_CACHE=true) is prohibited for production data persistence.`
+  );
+}
+
 if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR, { recursive: true });
 }
@@ -91,6 +123,28 @@ export function initDatabase() {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+      detail TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS profile_ownership_migrations (
+      id TEXT PRIMARY KEY,
+      profile_id TEXT NOT NULL,
+      previous_owner_id TEXT,
+      new_owner_id TEXT NOT NULL,
+      performed_by TEXT NOT NULL,
+      reason TEXT,
+      detail TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      rolled_back_at TEXT,
+      rolled_back_by TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_profile_ownership_migrations_profile
+      ON profile_ownership_migrations(profile_id, created_at);
+
     CREATE TABLE IF NOT EXISTS profiles (
       id TEXT PRIMARY KEY,
       handle TEXT NOT NULL,
@@ -109,6 +163,7 @@ export function initDatabase() {
     CREATE TABLE IF NOT EXISTS notification_settings (
       profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
       contest_reminders INTEGER NOT NULL DEFAULT 0,
+      contest_reminder_offsets TEXT NOT NULL DEFAULT '[30]',
       daily_reminders INTEGER NOT NULL DEFAULT 0,
       reminder_time TEXT NOT NULL DEFAULT '20:00',
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -386,6 +441,10 @@ export function initDatabase() {
   `);
 
   migrateProfilesForPublicAccess();
+  db.prepare(`
+    INSERT OR IGNORE INTO schema_migrations (version, detail)
+    VALUES ('0001_initial_schema', 'Base CP Coach SQLite schema')
+  `).run();
 
   // 2. Ensure the local default profile exists. A public deployment starts
   // empty and creates isolated profiles from validated browser requests.
@@ -540,6 +599,12 @@ export function initDatabase() {
     `);
   }
 
+  const notificationSettingsColumns = db.prepare('PRAGMA table_info(notification_settings)')
+    .all() as Array<{ name: string }>;
+  if (!notificationSettingsColumns.some((column) => column.name === 'contest_reminder_offsets')) {
+    db.exec("ALTER TABLE notification_settings ADD COLUMN contest_reminder_offsets TEXT NOT NULL DEFAULT '[30]';");
+  }
+
   // Create multi-profile indices
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_daily_sets_profile_date ON daily_sets(profile_id, date);
@@ -689,6 +754,17 @@ export function initDatabase() {
       db.prepare("INSERT INTO settings (key, value) VALUES ('active_profile_id', 'prof_obadajo')").run();
     }
   }
+}
+
+export function getAppliedSchemaMigrations(): Array<{ version: string; appliedAt: string; detail: string | null }> {
+  const rows = db.prepare(
+    'SELECT version, applied_at, detail FROM schema_migrations ORDER BY version ASC'
+  ).all() as Array<{ version: string; applied_at: string; detail: string | null }>;
+  return rows.map((row) => ({
+    version: row.version,
+    appliedAt: row.applied_at,
+    detail: row.detail ?? null,
+  }));
 }
 
 // Curriculum helpers
@@ -889,6 +965,7 @@ export function getProfilesForOwner(clientId: string): UserProfile[] {
   return rows.map((r) => ({
     id: r.id,
     handle: r.handle,
+    ownerId: r.owner_id ?? null,
     displayName: r.display_name || r.handle,
     avatar: r.avatar,
     rating: r.rating,
@@ -901,6 +978,375 @@ export function getProfilesForOwner(clientId: string): UserProfile[] {
   }));
 }
 
+export function getProfileForOwner(profileId: string, ownerId: string): UserProfile | null {
+  const cleanOwnerId = ownerId.trim().toLowerCase();
+  const r = db.prepare('SELECT * FROM profiles WHERE id = ? AND owner_id = ?').get(profileId, cleanOwnerId) as any;
+  if (!r) return null;
+  return {
+    id: r.id,
+    handle: r.handle,
+    ownerId: r.owner_id ?? null,
+    displayName: r.display_name || r.handle,
+    avatar: r.avatar,
+    rating: r.rating,
+    maxRating: r.max_rating,
+    rank: r.rank,
+    maxRank: r.max_rank,
+    isDefault: Boolean(r.is_default),
+    createdAt: r.created_at,
+    lastActiveAt: r.last_active_at,
+  };
+}
+
+export function isProfileOwnedBy(profileId: string, ownerId: string): boolean {
+  const cleanOwnerId = ownerId.trim().toLowerCase();
+  const row = db.prepare('SELECT owner_id FROM profiles WHERE id = ?').get(profileId) as { owner_id: string | null } | undefined;
+  return Boolean(row && row.owner_id && row.owner_id.toLowerCase() === cleanOwnerId);
+}
+
+const PROFILE_DATA_TABLES = [
+  'problem_learning_events',
+  'solve_sessions',
+  'review_queue',
+  'contest_problem_reviews',
+  'user_contests',
+  'weekly_goals',
+  'learner_profile_state',
+  'daily_problems',
+  'daily_sets',
+] as const;
+
+const PROFILE_AUXILIARY_TABLES = [
+  'notification_deliveries',
+  'push_subscriptions',
+  'notification_settings',
+] as const;
+
+function countProfileRows(profileId: string): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const table of [...PROFILE_DATA_TABLES, ...PROFILE_AUXILIARY_TABLES]) {
+    try {
+      const row = db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE profile_id = ?`).get(profileId) as { c?: number } | undefined;
+      counts[table] = Number(row?.c || 0);
+    } catch {
+      counts[table] = 0;
+    }
+  }
+  return counts;
+}
+
+function deleteProfileRowsUnsafe(profileId: string): void {
+  for (const table of [
+    ...PROFILE_AUXILIARY_TABLES,
+    ...PROFILE_DATA_TABLES,
+  ]) {
+    try {
+      db.prepare(`DELETE FROM ${table} WHERE profile_id = ?`).run(profileId);
+    } catch {
+      // Older databases may not have every optional table yet.
+    }
+  }
+  db.prepare('DELETE FROM profiles WHERE id = ?').run(profileId);
+}
+
+export interface LegacyClaimOptions {
+  legacyOwnerId?: string | null;
+  performedBy?: string;
+  reason?: string;
+  dryRun?: boolean;
+  allowReassign?: boolean;
+}
+
+export interface LegacyClaimResult {
+  success: boolean;
+  dryRun: boolean;
+  profile: UserProfile;
+  previousOwnerId: string | null;
+  targetOwnerId: string;
+  alreadyOwned: boolean;
+  migratedCounts: Record<string, number>;
+  migrationId: string | null;
+  warnings: string[];
+}
+
+function resolveLegacyTarget(
+  targetIdOrHandle: string,
+  legacyOwnerId?: string | null,
+): any {
+  const byId = db.prepare('SELECT * FROM profiles WHERE id = ?').get(targetIdOrHandle) as any;
+  if (byId) return byId;
+
+  const rows = db.prepare('SELECT * FROM profiles WHERE lower(handle) = lower(?)').all(targetIdOrHandle) as any[];
+  if (rows.length === 0) {
+    throw new Error(`Legacy profile '${targetIdOrHandle}' was not found.`);
+  }
+
+  if (legacyOwnerId) {
+    const cleanLegacyOwner = legacyOwnerId.trim().toLowerCase();
+    const owned = rows.filter((row) => (
+      typeof row.owner_id === 'string' && row.owner_id.toLowerCase() === cleanLegacyOwner
+    ));
+    if (owned.length === 1) return owned[0];
+    if (owned.length > 1) {
+      throw new Error(`Multiple profiles for handle '${targetIdOrHandle}' are owned by '${legacyOwnerId}'. Specify the profile id instead.`);
+    }
+  }
+
+  const unowned = rows.filter((row) => row.owner_id === null || row.owner_id === '');
+  if (!legacyOwnerId && unowned.length === 1) return unowned[0];
+  if (rows.length === 1 && !legacyOwnerId) return rows[0];
+
+  throw new Error(
+    `Multiple profiles exist for handle '${targetIdOrHandle}'. Specify the exact profile id and, for client-id owned data, the legacy owner id.`
+  );
+}
+
+/**
+ * Explicitly links legacy data to an authenticated Supabase user. This function
+ * never uses a request-supplied owner id as the new owner; the caller must pass
+ * a verified `userId`. Reassigning a profile that already has a non-null owner
+ * additionally requires `allowReassign` and a matching `legacyOwnerId`.
+ */
+export function claimLegacyProfile(
+  userId: string,
+  targetIdOrHandle: string,
+  options: LegacyClaimOptions = {},
+): LegacyClaimResult {
+  const cleanOwnerId = userId.trim().toLowerCase();
+  const cleanTarget = targetIdOrHandle.trim();
+  const legacyOwnerId = options.legacyOwnerId?.trim().toLowerCase() || null;
+
+  const target = resolveLegacyTarget(cleanTarget, legacyOwnerId);
+  const previousOwnerId = typeof target.owner_id === 'string' ? target.owner_id : null;
+  const alreadyOwned = Boolean(
+    previousOwnerId && previousOwnerId.toLowerCase() === cleanOwnerId
+  );
+  const migratedCounts = countProfileRows(target.id);
+  const warnings: string[] = [];
+
+  if (alreadyOwned) {
+    return {
+      success: true,
+      dryRun: options.dryRun === true,
+      profile: getProfileById(target.id)!,
+      previousOwnerId,
+      targetOwnerId: cleanOwnerId,
+      alreadyOwned: true,
+      migratedCounts,
+      migrationId: null,
+      warnings,
+    };
+  }
+
+  if (previousOwnerId) {
+    if (!options.allowReassign) {
+      throw new Error(
+        `Profile '${target.handle}' is owned by legacy client '${previousOwnerId}' and cannot be reassigned without explicit migration approval.`
+      );
+    }
+    if (!legacyOwnerId || previousOwnerId.toLowerCase() !== legacyOwnerId) {
+      throw new Error(
+        `The legacy owner id does not match the current owner of profile '${target.handle}'. No data was changed.`
+      );
+    }
+  }
+
+  const existingSameHandle = db.prepare(`
+    SELECT * FROM profiles
+    WHERE lower(owner_id) = lower(?) AND lower(handle) = lower(?) AND id <> ?
+  `).get(cleanOwnerId, target.handle, target.id) as any;
+
+  let emptyProfileToRemove: any = null;
+  if (existingSameHandle) {
+    const existingCounts = countProfileRows(existingSameHandle.id);
+    const existingTotal = Object.values(existingCounts).reduce((total, count) => total + count, 0);
+    if (existingTotal > 0) {
+      throw new Error(
+        `Your account already has non-empty profile data for '${target.handle}'. Export that profile first, then use an administrator-assisted merge; no data was changed.`
+      );
+    }
+    emptyProfileToRemove = existingSameHandle;
+    warnings.push(
+      `The empty auto-created profile '${existingSameHandle.id}' will be removed and replaced by the legacy profile.`
+    );
+  }
+
+  if (options.dryRun) {
+    return {
+      success: true,
+      dryRun: true,
+      profile: getProfileById(target.id)!,
+      previousOwnerId,
+      targetOwnerId: cleanOwnerId,
+      alreadyOwned: false,
+      migratedCounts,
+      migrationId: null,
+      warnings,
+    };
+  }
+
+  const migrationId = `pom_${randomUUID().replace(/-/g, '')}`;
+  const pushSnapshot = db.prepare(
+    'SELECT endpoint_hash, owner_id FROM push_subscriptions WHERE profile_id = ?'
+  ).all(target.id);
+
+  db.exec('BEGIN IMMEDIATE TRANSACTION;');
+  try {
+    if (emptyProfileToRemove) {
+      deleteProfileRowsUnsafe(emptyProfileToRemove.id);
+    }
+
+    db.prepare(`
+      UPDATE profiles
+      SET owner_id = ?, last_active_at = datetime('now')
+      WHERE id = ?
+    `).run(cleanOwnerId, target.id);
+
+    db.prepare(`
+      UPDATE push_subscriptions
+      SET owner_id = ?, updated_at = datetime('now')
+      WHERE profile_id = ?
+    `).run(cleanOwnerId, target.id);
+
+    db.prepare(`
+      INSERT INTO profile_ownership_migrations (
+        id, profile_id, previous_owner_id, new_owner_id, performed_by, reason, detail
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      migrationId,
+      target.id,
+      previousOwnerId,
+      cleanOwnerId,
+      options.performedBy || 'authenticated-user',
+      options.reason || 'legacy-profile-claim',
+      JSON.stringify({
+        pushSubscriptions: pushSnapshot,
+        removedEmptyProfileId: emptyProfileToRemove?.id || null,
+        migratedCounts,
+      }),
+    );
+
+    db.exec('COMMIT;');
+  } catch (error) {
+    try { db.exec('ROLLBACK;'); } catch {}
+    throw error;
+  }
+
+  return {
+    success: true,
+    dryRun: false,
+    profile: getProfileById(target.id)!,
+    previousOwnerId,
+    targetOwnerId: cleanOwnerId,
+    alreadyOwned: false,
+    migratedCounts,
+    migrationId,
+    warnings,
+  };
+}
+
+export interface OwnershipMigrationRecord {
+  id: string;
+  profileId: string;
+  previousOwnerId: string | null;
+  newOwnerId: string;
+  performedBy: string;
+  reason: string | null;
+  createdAt: string;
+  rolledBackAt: string | null;
+  rolledBackBy: string | null;
+}
+
+export function listProfileOwnershipMigrations(profileId?: string): OwnershipMigrationRecord[] {
+  const rows = (profileId
+    ? db.prepare(`
+        SELECT * FROM profile_ownership_migrations
+        WHERE profile_id = ?
+        ORDER BY created_at DESC, id DESC
+      `).all(profileId)
+    : db.prepare(`
+        SELECT * FROM profile_ownership_migrations
+        ORDER BY created_at DESC, id DESC
+      `).all()) as any[];
+  return rows.map((row) => ({
+    id: row.id,
+    profileId: row.profile_id,
+    previousOwnerId: row.previous_owner_id ?? null,
+    newOwnerId: row.new_owner_id,
+    performedBy: row.performed_by,
+    reason: row.reason ?? null,
+    createdAt: row.created_at,
+    rolledBackAt: row.rolled_back_at ?? null,
+    rolledBackBy: row.rolled_back_by ?? null,
+  }));
+}
+
+/**
+ * Reverts an ownership migration only while the profile is still owned by the
+ * account that received it. The previous push-subscription owner ids are
+ * restored from the audit snapshot.
+ */
+export function revertProfileOwnershipMigration(
+  migrationId: string,
+  performedBy: string = 'administrator',
+): { success: boolean; profile: UserProfile; previousOwnerId: string | null } {
+  const migration = db.prepare(
+    'SELECT * FROM profile_ownership_migrations WHERE id = ?'
+  ).get(migrationId) as any;
+  if (!migration) throw new Error(`Ownership migration '${migrationId}' was not found.`);
+  if (migration.rolled_back_at) throw new Error(`Ownership migration '${migrationId}' was already rolled back.`);
+
+  const profile = db.prepare('SELECT * FROM profiles WHERE id = ?').get(migration.profile_id) as any;
+  if (!profile) throw new Error('The migrated profile no longer exists. No data was changed.');
+  if (
+    typeof profile.owner_id !== 'string' ||
+    profile.owner_id.toLowerCase() !== String(migration.new_owner_id).toLowerCase()
+  ) {
+    throw new Error('The profile owner changed after the migration. Refusing to roll back. No data was changed.');
+  }
+
+  let detail: { pushSubscriptions?: Array<{ endpoint_hash: string; owner_id: string }> } = {};
+  try {
+    detail = migration.detail ? JSON.parse(migration.detail) : {};
+  } catch {
+    detail = {};
+  }
+
+  db.exec('BEGIN IMMEDIATE TRANSACTION;');
+  try {
+    db.prepare(`
+      UPDATE profiles
+      SET owner_id = ?, last_active_at = datetime('now')
+      WHERE id = ?
+    `).run(migration.previous_owner_id ?? null, migration.profile_id);
+
+    for (const subscription of detail.pushSubscriptions || []) {
+      db.prepare(`
+        UPDATE push_subscriptions
+        SET owner_id = ?, updated_at = datetime('now')
+        WHERE endpoint_hash = ? AND profile_id = ?
+      `).run(subscription.owner_id, subscription.endpoint_hash, migration.profile_id);
+    }
+
+    db.prepare(`
+      UPDATE profile_ownership_migrations
+      SET rolled_back_at = datetime('now'), rolled_back_by = ?
+      WHERE id = ?
+    `).run(performedBy, migrationId);
+
+    db.exec('COMMIT;');
+  } catch (error) {
+    try { db.exec('ROLLBACK;'); } catch {}
+    throw error;
+  }
+
+  return {
+    success: true,
+    profile: getProfileById(migration.profile_id)!,
+    previousOwnerId: migration.previous_owner_id ?? null,
+  };
+}
+
 export function getPublicProfileOwner(profileId: string): string | null {
   const row = db.prepare('SELECT owner_id FROM profiles WHERE id = ?').get(profileId) as { owner_id: string | null } | undefined;
   return row?.owner_id ?? null;
@@ -909,20 +1355,11 @@ export function getPublicProfileOwner(profileId: string): string | null {
 export function deletePublicProfile(clientId: string, profileId: string): boolean {
   const ownerId = clientId.trim().toLowerCase();
   const row = db.prepare('SELECT owner_id FROM profiles WHERE id = ?').get(profileId) as { owner_id: string | null } | undefined;
-  if (!row || row.owner_id !== ownerId) return false;
+  if (!row || typeof row.owner_id !== 'string' || row.owner_id.toLowerCase() !== ownerId) return false;
 
   db.exec('BEGIN TRANSACTION');
   try {
-    db.prepare('DELETE FROM problem_learning_events WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM solve_sessions WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM review_queue WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM contest_problem_reviews WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM user_contests WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM weekly_goals WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM learner_profile_state WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM daily_problems WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM daily_sets WHERE profile_id = ?').run(profileId);
-    db.prepare('DELETE FROM profiles WHERE id = ?').run(profileId);
+    deleteProfileRowsUnsafe(profileId);
     db.exec('COMMIT;');
   } catch (err) {
     try { db.exec('ROLLBACK;'); } catch {}
@@ -937,6 +1374,7 @@ export function getAllProfiles(): UserProfile[] {
   return rows.map((r) => ({
     id: r.id,
     handle: r.handle,
+    ownerId: r.owner_id ?? null,
     displayName: r.display_name || r.handle,
     avatar: r.avatar,
     rating: r.rating,
@@ -955,6 +1393,7 @@ export function getProfileById(id: string): UserProfile | null {
   return {
     id: r.id,
     handle: r.handle,
+    ownerId: r.owner_id ?? null,
     displayName: r.display_name || r.handle,
     avatar: r.avatar,
     rating: r.rating,
@@ -973,6 +1412,7 @@ export function getProfileByHandle(handle: string): UserProfile | null {
   return {
     id: r.id,
     handle: r.handle,
+    ownerId: r.owner_id ?? null,
     displayName: r.display_name || r.handle,
     avatar: r.avatar,
     rating: r.rating,

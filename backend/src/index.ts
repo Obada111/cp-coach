@@ -7,6 +7,15 @@ import { requireApiToken, requireConfiguredToken } from './auth.js';
 import { codeforcesCacheService } from './codeforcesCacheService.js';
 import { notificationsService } from './notificationsService.js';
 import { createCorsMiddleware, getAllowedCorsOrigins } from './cors.js';
+import { socialRouter } from './socialRoutes.js';
+import { closeSocialDatabase } from './socialDatabase.js';
+import { socialSyncService } from './socialSyncService.js';
+import {
+  getDatabaseHealthSummary,
+  runDatabaseMaintenance,
+  startDatabaseMaintenanceScheduler,
+  stopDatabaseMaintenanceScheduler,
+} from './databaseMaintenance.js';
 
 import path from 'path';
 import fs from 'fs';
@@ -32,7 +41,36 @@ if (process.env.PERF_TIMINGS === 'true') {
     databaseInitMs: Math.round((performance.now() - databaseInitStartedAt) * 10) / 10,
   }));
 }
+
+const PUBLIC_MODE_CONFIGURED = process.env.PUBLIC_MODE === 'true';
+if (
+  process.env.NODE_ENV === 'production' &&
+  PUBLIC_MODE_CONFIGURED &&
+  (!process.env.SUPABASE_URL?.trim() || !process.env.SUPABASE_ANON_KEY?.trim())
+) {
+  throw new Error(
+    'SUPABASE_URL and SUPABASE_ANON_KEY are required in production public mode. ' +
+    'Refusing to start an unauthenticated public deployment.',
+  );
+}
+
+const databaseMaintenance = await runDatabaseMaintenance();
+if (process.env.NODE_ENV === 'production') {
+  if (databaseMaintenance.integrity !== 'ok') {
+    throw new Error('Database integrity verification failed during startup.');
+  }
+  if (databaseMaintenance.lastError) {
+    throw new Error(`Database maintenance failed during startup: ${databaseMaintenance.lastError}`);
+  }
+  if (databaseMaintenance.backupCount === 0 && process.env.ALLOW_EPHEMERAL_DB_CACHE !== 'true' && !process.env.DATABASE_URL?.trim()) {
+    throw new Error(
+      'No verified database backup is available at startup. Configure DB_BACKUP_DIR on the persistent disk and DB_BACKUP_ON_STARTUP=true.',
+    );
+  }
+}
+startDatabaseMaintenanceScheduler();
 notificationsService.startBackgroundWorker();
+socialSyncService.startBackgroundWorker();
 
 const app = express();
 app.set('trust proxy', 1);
@@ -63,6 +101,7 @@ app.use((req, res, next) => {
 });
 
 // Public browser API: no server secret is embedded in the frontend.
+app.use('/api/social', socialRouter);
 app.use('/api/public', publicRouter);
 
 // The legacy profile/database API remains private. On a public deployment it
@@ -81,6 +120,7 @@ app.get('/health', (req, res) => {
     res.json({
       status: 'ok',
       database: 'ok',
+      durability: getDatabaseHealthSummary(),
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
@@ -88,6 +128,7 @@ app.get('/health', (req, res) => {
     res.status(503).json({
       status: 'degraded',
       database: 'unavailable',
+      durability: getDatabaseHealthSummary(),
       timestamp: new Date().toISOString(),
     });
   }
@@ -132,8 +173,11 @@ const shutdown = async (signal: string): Promise<void> => {
   await new Promise<void>((resolve) => {
     server.close(() => resolve());
   });
+  stopDatabaseMaintenanceScheduler();
   await codeforcesCacheService.shutdown();
+  await socialSyncService.shutdown();
   await notificationsService.shutdown();
+  await closeSocialDatabase();
   db.close();
   console.log('[CP Coach Backend] Shutdown complete.');
 };

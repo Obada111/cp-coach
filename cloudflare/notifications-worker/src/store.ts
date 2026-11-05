@@ -4,10 +4,11 @@ import type {
   PushSubscription,
   WorkerStats,
 } from './types';
-import { parseDailySnapshot } from './logic';
+import { isContestReminderOffset, parseDailySnapshot } from './logic';
+import type { ContestReminderOffsetMinutes } from './logic';
 
 const CLAIM_RECOVERY_MS = 15 * 60_000;
-const CONTEST_LOOKAHEAD_SECONDS = 30 * 60;
+const CONTEST_REMINDER_WINDOW_SECONDS = 5 * 60;
 const SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60_000;
 
 interface DeliveryRow {
@@ -39,14 +40,21 @@ export class NotificationStore {
   async updateSettings(
     profileId: string,
     ownerId: string,
-    settings: { contestReminders: boolean; dailyReminders: boolean; reminderTime: string },
+    settings: {
+      contestReminders: boolean;
+      contestReminderOffsets?: ContestReminderOffsetMinutes[];
+      dailyReminders: boolean;
+      reminderTime: string;
+    },
   ): Promise<boolean> {
     const result = await this.db.prepare(`
       UPDATE notification_profiles
-      SET contest_reminders = ?, daily_reminders = ?, reminder_time = ?, updated_at = ?
+      SET contest_reminders = ?, contest_reminder_offsets = ?,
+          daily_reminders = ?, reminder_time = ?, updated_at = ?
       WHERE profile_id = ? AND owner_id = ?
     `).bind(
       Number(settings.contestReminders),
+      JSON.stringify(settings.contestReminderOffsets ?? [30]),
       Number(settings.dailyReminders),
       settings.reminderTime,
       new Date().toISOString(),
@@ -199,46 +207,82 @@ export class NotificationStore {
     const row = await this.db.prepare(`
       SELECT
         p.profile_id, p.owner_id, p.cf_handle, p.contest_reminders, p.daily_reminders,
+        p.contest_reminder_offsets,
         p.reminder_time, p.timezone, p.snapshot_date, p.daily_snapshot,
         p.snapshot_synced_at, p.submissions_checked_at, p.verification_retry_after,
         s.endpoint_hash, s.profile_id AS subscription_profile_id, s.owner_id AS subscription_owner_id,
         s.endpoint, s.p256dh, s.auth,
-        c.contest_id, c.name AS contest_name, c.start_time_seconds
+        c.contest_id, c.name AS contest_name, c.start_time_seconds,
+        CAST(reminder.value AS INTEGER) AS reminder_offset_minutes
       FROM notification_contests c
       JOIN notification_profiles p ON p.contest_reminders = 1
+      JOIN json_each(p.contest_reminder_offsets) reminder
       JOIN notification_subscriptions s
         ON s.profile_id = p.profile_id AND s.owner_id = p.owner_id AND s.active = 1
       LEFT JOIN notification_deliveries d
         ON d.profile_id = p.profile_id
         AND d.endpoint_hash = s.endpoint_hash
-        AND d.notification_key = 'contest:' || c.contest_id
+        AND d.notification_key = 'contest:' || c.contest_id || ':' ||
+          c.start_time_seconds || ':' || reminder.value
+      LEFT JOIN notification_deliveries legacy
+        ON CAST(reminder.value AS INTEGER) = 30
+        AND legacy.profile_id = p.profile_id
+        AND legacy.endpoint_hash = s.endpoint_hash
+        AND julianday(legacy.created_at) >= julianday(
+          c.start_time_seconds - CAST(reminder.value AS INTEGER) * 60,
+          'unixepoch'
+        )
+        AND julianday(legacy.created_at) <= julianday(
+          c.start_time_seconds - CAST(reminder.value AS INTEGER) * 60 +
+            ${CONTEST_REMINDER_WINDOW_SECONDS},
+          'unixepoch'
+        )
+        AND legacy.notification_key IN (
+          'contest:' || c.contest_id,
+          'contest:' || c.contest_id || ':30'
+        )
       WHERE c.phase = 'BEFORE'
+        AND CAST(reminder.value AS INTEGER) IN (1440, 60, 30, 5)
         AND c.start_time_seconds > ?
-        AND c.start_time_seconds <= ?
+        AND c.start_time_seconds - CAST(reminder.value AS INTEGER) * 60 <= ?
         AND (
-          d.delivery_id IS NULL
+          (d.delivery_id IS NULL
+            AND c.start_time_seconds - CAST(reminder.value AS INTEGER) * 60 >= ?
+            AND (
+              legacy.delivery_id IS NULL
+              OR (legacy.status = 'FAILED' AND legacy.retry_after <= ?)
+              OR (legacy.status = 'CLAIMED' AND legacy.claimed_at <= ?)
+            ))
           OR (d.status = 'FAILED' AND d.retry_after <= ?)
           OR (d.status = 'CLAIMED' AND d.claimed_at <= ?)
         )
-      ORDER BY c.start_time_seconds, p.profile_id, s.endpoint_hash
+      ORDER BY c.start_time_seconds - CAST(reminder.value AS INTEGER) * 60,
+        p.profile_id, s.endpoint_hash
       LIMIT 1
     `).bind(
       nowSeconds,
-      nowSeconds + CONTEST_LOOKAHEAD_SECONDS,
+      nowSeconds,
+      nowSeconds - CONTEST_REMINDER_WINDOW_SECONDS,
+      retryAt,
+      staleClaimAt,
       retryAt,
       staleClaimAt,
     ).first<Record<string, unknown>>();
     if (!row) return null;
+    const reminderOffsets = [Number(row.reminder_offset_minutes)]
+      .filter(isContestReminderOffset);
+    if (reminderOffsets.length !== 1) return null;
     const profile = this.profileFromJoinedRow(row);
     const subscription = this.subscriptionFromJoinedRow(row);
     return {
       profile,
       subscription,
-      notificationKey: `contest:${Number(row.contest_id)}`,
+      notificationKey: `contest:${Number(row.contest_id)}:${Number(row.start_time_seconds)}:${reminderOffsets[0]}`,
       kind: 'contest',
       contestId: Number(row.contest_id),
       contestName: String(row.contest_name),
       startTimeSeconds: Number(row.start_time_seconds),
+      reminderOffsetMinutes: reminderOffsets[0],
     };
   }
 
@@ -250,7 +294,7 @@ export class NotificationStore {
     const row = await this.db.prepare(`
       SELECT
         p.profile_id, p.owner_id, p.cf_handle, p.contest_reminders, p.daily_reminders,
-        p.reminder_time, p.timezone, p.snapshot_date, p.daily_snapshot,
+        p.contest_reminder_offsets, p.reminder_time, p.timezone, p.snapshot_date, p.daily_snapshot,
         p.snapshot_synced_at, p.submissions_checked_at, p.verification_retry_after,
         s.endpoint_hash, s.profile_id AS subscription_profile_id, s.owner_id AS subscription_owner_id,
         s.endpoint, s.p256dh, s.auth
@@ -475,12 +519,16 @@ export class NotificationStore {
   }
 
   async getHealth(now = new Date()): Promise<Record<string, unknown>> {
+    await this.db.prepare(`
+      SELECT contest_reminder_offsets FROM notification_profiles LIMIT 0
+    `).all();
     const state = await this.db.prepare(`
       SELECT last_started_at, last_completed_at, last_success_at, last_status
       FROM notification_worker_state WHERE singleton = 1
     `).first<Record<string, unknown>>();
     const latestRun = await this.db.prepare(`
-      SELECT run_id, started_at, completed_at, status, duration_ms, error_code
+      SELECT run_id, started_at, completed_at, status, pushes_attempted,
+        notifications_sent, duration_ms, error_code
       FROM notification_worker_runs ORDER BY started_at DESC LIMIT 1
     `).first<Record<string, unknown>>();
     const lastSuccessAt = typeof state?.last_success_at === 'string'
@@ -518,6 +566,7 @@ export class NotificationStore {
       owner_id: String(row.owner_id),
       cf_handle: String(row.cf_handle),
       contest_reminders: Number(row.contest_reminders),
+      contest_reminder_offsets: String(row.contest_reminder_offsets),
       daily_reminders: Number(row.daily_reminders),
       reminder_time: String(row.reminder_time),
       timezone: String(row.timezone),

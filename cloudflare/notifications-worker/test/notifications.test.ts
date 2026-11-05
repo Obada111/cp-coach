@@ -7,6 +7,7 @@ import { runScheduledWorker } from '../src/scheduler';
 import { NotificationStore } from '../src/store';
 import worker from '../src/index';
 import type { Env } from '../src/types';
+import type { ContestReminderOffsetMinutes } from '../src/logic';
 
 const now = new Date('2026-10-30T18:00:00.000Z');
 const ownerId = 'android-browser-client-012345';
@@ -98,6 +99,7 @@ async function generateSubscription(): Promise<{
 
 async function seedProfile(options: {
   contestReminders?: boolean;
+  contestReminderOffsets?: ContestReminderOffsetMinutes[];
   dailyReminders?: boolean;
   reminderTime?: string;
   snapshotDate?: string | null;
@@ -111,6 +113,7 @@ async function seedProfile(options: {
   expect(await store.ensureProfile(id.profileId, id.ownerId, id.handle)).toBe(true);
   await store.updateSettings(id.profileId, id.ownerId, {
     contestReminders: options.contestReminders ?? false,
+    contestReminderOffsets: options.contestReminderOffsets ?? [30],
     dailyReminders: options.dailyReminders ?? true,
     reminderTime: options.reminderTime ?? '20:00',
   });
@@ -176,6 +179,34 @@ afterEach(async () => {
 });
 
 describe('Cloudflare D1 notification API', () => {
+  it('requires the backend secret for readiness checks and reports local D1 and VAPID status', async () => {
+    const response = await handleApiRequest(new Request(
+      'https://notifications.example/internal/v1/status',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-backend-secret',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
+      },
+    ), workerEnv({
+      VAPID_PUBLIC_KEY: 'test-vapid-public',
+      VAPID_PRIVATE_KEY: 'test-vapid-private',
+    }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: 'ok',
+      storageReady: true,
+      apiSecretConfigured: true,
+      vapidConfigured: true,
+      vapidPublicKey: 'test-vapid-public',
+    });
+
+    const unauthorized = await postInternal('/internal/v1/status', {}, 'wrong-secret');
+    expect(unauthorized.status).toBe(401);
+  });
+
   it('requires backend authentication and rejects malformed profile ownership', async () => {
     const response = await postInternal('/internal/v1/profiles/ensure', {
       profileId: 'pub_invalid',
@@ -217,13 +248,26 @@ describe('Cloudflare D1 notification API', () => {
     const updated = await postInternal('/internal/v1/settings/update', {
       ...id,
       contestReminders: true,
+      contestReminderOffsets: [60, 30, 5],
       dailyReminders: true,
       reminderTime: '20:00',
     });
     expect(updated.status).toBe(200);
+    expect(await updated.json()).toMatchObject({
+      settings: { contestReminderOffsets: [60, 30, 5] },
+    });
+    const invalidOffsets = await postInternal('/internal/v1/settings/update', {
+      ...id,
+      contestReminders: true,
+      contestReminderOffsets: [5, 5],
+      dailyReminders: true,
+      reminderTime: '20:00',
+    });
+    expect(invalidOffsets.status).toBe(400);
     const rejected = await postInternal('/internal/v1/settings/update', {
       ...id,
       contestReminders: true,
+      contestReminderOffsets: [30],
       dailyReminders: true,
       reminderTime: '24:00',
     });
@@ -283,6 +327,16 @@ describe('Cloudflare scheduled reminders', () => {
       VAPID_PRIVATE_KEY: vapid.privateKey,
     }), now);
     expect(stats).toMatchObject({ status: 'SUCCEEDED', pushesAttempted: 1, notificationsSent: 1 });
+    const health = await handleApiRequest(
+      new Request('https://notifications.example/health'),
+      workerEnv({
+        VAPID_PUBLIC_KEY: vapid.publicKey,
+        VAPID_PRIVATE_KEY: vapid.privateKey,
+      }),
+    );
+    expect(await health.json()).toMatchObject({
+      latestRun: { pushes_attempted: 1, notifications_sent: 1 },
+    });
     const pushRequest = externalFetch.mock.calls.find(([input]) => String(input).startsWith('https://fcm.googleapis.com/'));
     expect(pushRequest).toBeTruthy();
     const deliveries = await testDb.prepare(`
@@ -331,11 +385,292 @@ describe('Cloudflare scheduled reminders', () => {
     expect(second.notificationsSent).toBe(0);
     expect(externalFetch.mock.calls.filter(([input]) => String(input).includes('/api/contest.list'))).toHaveLength(1);
     expect(externalFetch.mock.calls.filter(([input]) => String(input).startsWith('https://fcm.googleapis.com/'))).toHaveLength(1);
+    const delivery = await testDb.prepare(`
+      SELECT notification_key, status FROM notification_deliveries
+      WHERE endpoint_hash = ?
+    `).bind(subscriptions[0].endpointHash).first<{ notification_key: string; status: string }>();
+    expect(delivery).toEqual({
+      notification_key: `contest:70001:${startSeconds}:30`,
+      status: 'SENT',
+    });
     const stored = await testDb.prepare(`
       SELECT phase FROM notification_contests WHERE contest_id = 70001
     `).first<{ phase: string }>();
     expect(stored?.phase).toBe('BEFORE');
     expect(subscriptions).toHaveLength(1);
+  });
+
+  it('drains simultaneous reminders across multiple contests, profiles, and devices without duplicates', async () => {
+    const first = await seedProfile({
+      contestReminders: true,
+      contestReminderOffsets: [30],
+      dailyReminders: false,
+      subscriptions: 2,
+    });
+    const second = await seedProfile({
+      contestReminders: true,
+      contestReminderOffsets: [30],
+      dailyReminders: false,
+      subscriptions: 2,
+    });
+    const third = await seedProfile({
+      contestReminders: true,
+      contestReminderOffsets: [30],
+      dailyReminders: false,
+      subscriptions: 2,
+    });
+    const vapid = await generateVapid();
+    const startSeconds = Math.floor(now.getTime() / 1000) + 30 * 60;
+    const contests = [73001, 73002].map((id) => ({
+      id,
+      name: `Simultaneous contest ${id}`,
+      startTimeSeconds: startSeconds,
+      durationSeconds: 7200,
+      phase: 'BEFORE',
+    }));
+    const pushRequests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/contest.list')) return Response.json({ status: 'OK', result: contests });
+      if (url.startsWith('https://fcm.googleapis.com/')) {
+        pushRequests.push(url);
+        return new Response(null, { status: 201 });
+      }
+      throw new Error(`Unexpected outbound request: ${url}`);
+    }));
+    const configuration = workerEnv({
+      VAPID_PUBLIC_KEY: vapid.publicKey,
+      VAPID_PRIVATE_KEY: vapid.privateKey,
+    });
+
+    const firstRun = await runScheduledWorker(configuration, now);
+    expect(firstRun).toMatchObject({ profilesChecked: 3, pushesAttempted: 10, notificationsSent: 10 });
+    const secondRun = await runScheduledWorker(configuration, now);
+    expect(secondRun).toMatchObject({ pushesAttempted: 2, notificationsSent: 2 });
+    expect((await runScheduledWorker(configuration, now)).notificationsSent).toBe(0);
+    expect(pushRequests).toHaveLength(12);
+
+    for (const profile of [first, second, third]) {
+      const deliveries = await testDb.prepare(`
+        SELECT notification_key, COUNT(*) AS count
+        FROM notification_deliveries
+        WHERE profile_id = ? AND status = 'SENT'
+        GROUP BY notification_key
+      `).bind(profile.id.profileId).all<{ notification_key: string; count: number }>();
+      expect(deliveries.results).toHaveLength(2);
+      expect(deliveries.results.every((delivery) => delivery.count === 2)).toBe(true);
+    }
+  });
+
+  it('sends each configured contest reminder offset once and prevents duplicates', async () => {
+    const offsets: ContestReminderOffsetMinutes[] = [1440, 60, 30, 5];
+    const { id, subscriptions } = await seedProfile({
+      contestReminders: true,
+      contestReminderOffsets: offsets,
+      dailyReminders: false,
+    });
+    const vapid = await generateVapid();
+    const nowSeconds = Math.floor(now.getTime() / 1000);
+    const contests = offsets.map((offset, index) => ({
+      id: 71000 + index,
+      name: `Offset ${offset} contest`,
+      startTimeSeconds: nowSeconds + offset * 60,
+      durationSeconds: 7200,
+      phase: 'BEFORE',
+    }));
+    const pushRequests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/contest.list')) {
+        return Response.json({ status: 'OK', result: contests });
+      }
+      if (url.startsWith('https://fcm.googleapis.com/')) {
+        pushRequests.push(url);
+        return new Response(null, { status: 201 });
+      }
+      throw new Error(`Unexpected outbound request: ${url}`);
+    }));
+    const configuration = workerEnv({
+      VAPID_PUBLIC_KEY: vapid.publicKey,
+      VAPID_PRIVATE_KEY: vapid.privateKey,
+    });
+
+    const batch = await runScheduledWorker(configuration, now);
+    expect(batch).toMatchObject({ pushesAttempted: 4, notificationsSent: 4 });
+    expect((await runScheduledWorker(configuration, now)).notificationsSent).toBe(0);
+    expect(pushRequests).toHaveLength(4);
+    const deliveries = await testDb.prepare(`
+      SELECT notification_key, status FROM notification_deliveries
+      WHERE profile_id = ? ORDER BY notification_key
+    `).bind(id.profileId).all<{ notification_key: string; status: string }>();
+    expect(deliveries.results).toHaveLength(4);
+    expect(deliveries.results.every((delivery) => delivery.status === 'SENT')).toBe(true);
+    expect(new Set(deliveries.results.map((delivery) => delivery.notification_key)).size).toBe(4);
+    expect(subscriptions).toHaveLength(1);
+  });
+
+  it('processes a bounded batch across profiles and devices, then drains the remaining queue', async () => {
+    const profiles = [
+      await seedProfile({ dailyReminders: true, reminderTime: '20:00', subscriptions: 4 }),
+      await seedProfile({ dailyReminders: true, reminderTime: '20:00', subscriptions: 4 }),
+      await seedProfile({ dailyReminders: true, reminderTime: '20:00', subscriptions: 4 }),
+    ];
+    const vapid = await generateVapid();
+    const pushRequests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/user.status')) return Response.json({ status: 'OK', result: [] });
+      if (url.startsWith('https://fcm.googleapis.com/')) {
+        pushRequests.push(url);
+        return new Response(null, { status: 201 });
+      }
+      throw new Error(`Unexpected outbound request: ${url}`);
+    }));
+    const configuration = workerEnv({
+      VAPID_PUBLIC_KEY: vapid.publicKey,
+      VAPID_PRIVATE_KEY: vapid.privateKey,
+    });
+
+    const firstRun = await runScheduledWorker(configuration, now);
+    expect(firstRun).toMatchObject({
+      status: 'SUCCEEDED',
+      profilesChecked: 3,
+      pushesAttempted: 10,
+      notificationsSent: 10,
+    });
+    expect(pushRequests).toHaveLength(10);
+
+    const secondRun = await runScheduledWorker(configuration, now);
+    expect(secondRun).toMatchObject({ pushesAttempted: 2, notificationsSent: 2 });
+    expect(pushRequests).toHaveLength(12);
+    for (const profile of profiles) {
+      const sent = await testDb.prepare(`
+        SELECT COUNT(*) AS count FROM notification_deliveries
+        WHERE profile_id = ? AND status = 'SENT'
+      `).bind(profile.id.profileId).first<{ count: number }>();
+      expect(sent?.count).toBe(4);
+    }
+  });
+
+  it('continues to other due devices after a push failure and leaves the failed task retryable', async () => {
+    const { id, subscriptions } = await seedProfile({
+      dailyReminders: true,
+      reminderTime: '20:00',
+      subscriptions: 2,
+    });
+    const vapid = await generateVapid();
+    let pushCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/user.status')) return Response.json({ status: 'OK', result: [] });
+      if (url.startsWith('https://fcm.googleapis.com/')) {
+        pushCount += 1;
+        return new Response(null, { status: pushCount === 1 ? 503 : 201 });
+      }
+      throw new Error(`Unexpected outbound request: ${url}`);
+    }));
+
+    const stats = await runScheduledWorker(workerEnv({
+      VAPID_PUBLIC_KEY: vapid.publicKey,
+      VAPID_PRIVATE_KEY: vapid.privateKey,
+    }), now);
+    expect(stats).toMatchObject({ pushesAttempted: 2, notificationsSent: 1 });
+    expect(pushCount).toBe(2);
+    const deliveries = await testDb.prepare(`
+      SELECT status, retry_after FROM notification_deliveries
+      WHERE profile_id = ? ORDER BY endpoint_hash
+    `).bind(id.profileId).all<{ status: string; retry_after: string | null }>();
+    expect(deliveries.results.map((delivery) => delivery.status).sort()).toEqual(['FAILED', 'SENT']);
+    expect(deliveries.results.find((delivery) => delivery.status === 'FAILED')?.retry_after).toBeTruthy();
+    expect(subscriptions).toHaveLength(2);
+  });
+
+  it('re-arms reminders for a rescheduled contest and cancels reminders when the contest disappears', async () => {
+    const { store } = await seedProfile({
+      contestReminders: true,
+      contestReminderOffsets: [30],
+      dailyReminders: false,
+    });
+    const firstStart = Math.floor(now.getTime() / 1000) + 30 * 60;
+    await store.refreshContests([{
+      contest_id: 72001,
+      name: 'Rescheduled contest',
+      start_time_seconds: firstStart,
+      duration_seconds: 7200,
+      phase: 'BEFORE',
+      updated_at: now.toISOString(),
+    }], now);
+    const firstTask = await store.findContestTask(now);
+    expect(firstTask?.notificationKey).toBe(`contest:72001:${firstStart}:30`);
+
+    const updatedNow = new Date(now.getTime() + 10 * 60_000);
+    const updatedStart = Math.floor(updatedNow.getTime() / 1000) + 30 * 60;
+    await store.refreshContests([{
+      contest_id: 72001,
+      name: 'Rescheduled contest',
+      start_time_seconds: updatedStart,
+      duration_seconds: 7200,
+      phase: 'BEFORE',
+      updated_at: updatedNow.toISOString(),
+    }], updatedNow);
+    const updatedTask = await store.findContestTask(updatedNow);
+    expect(updatedTask?.notificationKey).toBe(`contest:72001:${updatedStart}:30`);
+
+    const cancelledAt = new Date(updatedNow.getTime() + 10 * 60_000);
+    await store.refreshContests([], cancelledAt);
+    expect(await store.findContestTask(cancelledAt)).toBeNull();
+    const stored = await testDb.prepare(`
+      SELECT phase FROM notification_contests WHERE contest_id = 72001
+    `).first<{ phase: string }>();
+    expect(stored?.phase).toBe('CANCELED');
+  });
+
+  it('retries a failed contest reminder after its scheduled window while the contest is upcoming', async () => {
+    const { id, subscriptions } = await seedProfile({
+      contestReminders: true,
+      contestReminderOffsets: [30],
+      dailyReminders: false,
+    });
+    const vapid = await generateVapid();
+    const startTimeSeconds = Math.floor(now.getTime() / 1000) + 30 * 60;
+    let pushCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/api/contest.list')) {
+        return Response.json({
+          status: 'OK',
+          result: [{
+            id: 70003,
+            name: 'Retry contest',
+            startTimeSeconds,
+            durationSeconds: 7200,
+            phase: 'BEFORE',
+          }],
+        });
+      }
+      if (String(input).startsWith('https://fcm.googleapis.com/')) {
+        pushCount += 1;
+        return new Response(null, { status: pushCount === 1 ? 503 : 201 });
+      }
+      throw new Error(`Unexpected outbound request: ${String(input)}`);
+    }));
+    const configuration = workerEnv({
+      VAPID_PUBLIC_KEY: vapid.publicKey,
+      VAPID_PRIVATE_KEY: vapid.privateKey,
+    });
+
+    await runScheduledWorker(configuration, now);
+    await runScheduledWorker(configuration, new Date(now.getTime() + 16 * 60_000));
+
+    expect(pushCount).toBe(2);
+    const delivery = await testDb.prepare(`
+      SELECT notification_key, status FROM notification_deliveries
+      WHERE profile_id = ? AND endpoint_hash = ?
+    `).bind(id.profileId, subscriptions[0].endpointHash)
+      .first<{ notification_key: string; status: string }>();
+    expect(delivery).toEqual({
+      notification_key: `contest:70003:${startTimeSeconds}:30`,
+      status: 'SENT',
+    });
   });
 
   it('recovers abandoned delivery claims after a Worker restart', async () => {
@@ -351,10 +686,11 @@ describe('Cloudflare scheduled reminders', () => {
     await testDb.prepare(`
       INSERT INTO notification_deliveries
         (delivery_id, profile_id, endpoint_hash, notification_key, status, claimed_at, created_at)
-      VALUES ('abandoned-claim', ?, ?, 'contest:70002', 'CLAIMED', ?, ?)
+      VALUES ('abandoned-claim', ?, ?, ?, 'CLAIMED', ?, ?)
     `).bind(
       id.profileId,
       endpointHash,
+      `contest:70002:${startTimeSeconds}:30`,
       new Date(now.getTime() - 16 * 60_000).toISOString(),
       new Date(now.getTime() - 16 * 60_000).toISOString(),
     ).run();
@@ -381,8 +717,9 @@ describe('Cloudflare scheduled reminders', () => {
       VAPID_PRIVATE_KEY: vapid.privateKey,
     }), now);
     const delivery = await testDb.prepare(`
-      SELECT status FROM notification_deliveries WHERE profile_id = ? AND notification_key = 'contest:70002'
-    `).bind(id.profileId).first<{ status: string }>();
+      SELECT status FROM notification_deliveries WHERE profile_id = ?
+        AND notification_key = ?
+    `).bind(id.profileId, `contest:70002:${startTimeSeconds}:30`).first<{ status: string }>();
     expect(stats.notificationsSent).toBe(1);
     expect(delivery?.status).toBe('SENT');
   });

@@ -17,6 +17,8 @@ const originalEnvironment = {
   publicKey: process.env.VAPID_PUBLIC_KEY,
   privateKey: process.env.VAPID_PRIVATE_KEY,
   subject: process.env.VAPID_SUBJECT,
+  cloudflareUrl: process.env.CLOUDFLARE_NOTIFICATIONS_URL,
+  cloudflareSecret: process.env.CLOUDFLARE_NOTIFICATIONS_API_SECRET,
 };
 const vapidKeys = webpush.generateVAPIDKeys();
 const profileIds: string[] = [];
@@ -120,11 +122,17 @@ describe('push subscriptions and settings', () => {
   it('fails closed on public deployments without durable notification storage', () => {
     process.env.PUBLIC_MODE = 'true';
     process.env.NOTIFICATIONS_STORAGE_DURABLE = 'false';
+    delete process.env.CLOUDFLARE_NOTIFICATIONS_URL;
+    delete process.env.CLOUDFLARE_NOTIFICATIONS_API_SECRET;
     expect(notificationsService.isAvailable()).toBe(false);
     expect(notificationsService.getPublicConfig()).toMatchObject({
       available: false,
       vapidPublicKey: null,
     });
+    if (originalEnvironment.cloudflareUrl === undefined) delete process.env.CLOUDFLARE_NOTIFICATIONS_URL;
+    else process.env.CLOUDFLARE_NOTIFICATIONS_URL = originalEnvironment.cloudflareUrl;
+    if (originalEnvironment.cloudflareSecret === undefined) delete process.env.CLOUDFLARE_NOTIFICATIONS_API_SECRET;
+    else process.env.CLOUDFLARE_NOTIFICATIONS_API_SECRET = originalEnvironment.cloudflareSecret;
     process.env.PUBLIC_MODE = 'false';
     process.env.NOTIFICATIONS_STORAGE_DURABLE = 'true';
   });
@@ -165,25 +173,50 @@ describe('push subscriptions and settings', () => {
 describe('reminder scheduling', () => {
   it('uses the 30-minute contest window and excludes contests already started', () => {
     const start = 1_800_000_000;
-    expect(isContestReminderDue(start, new Date((start - 30 * 60) * 1000))).toBe(true);
     expect(isContestReminderDue(start, new Date((start - 30 * 60 - 1) * 1000))).toBe(false);
+    expect(isContestReminderDue(start, new Date((start - 30 * 60) * 1000))).toBe(true);
+    expect(isContestReminderDue(start, new Date((start - 30 * 60 + 299) * 1000))).toBe(true);
+    expect(isContestReminderDue(start, new Date((start - 30 * 60 + 300) * 1000))).toBe(true);
+    expect(isContestReminderDue(start, new Date((start - 30 * 60 + 301) * 1000))).toBe(false);
     expect(isContestReminderDue(start, new Date(start * 1000))).toBe(false);
     expect(isContestReminderDue(start, new Date((start + 60) * 1000))).toBe(false);
   });
 
-  it('deduplicates delayed contest reminders across repeated worker runs and devices', async () => {
+  it('schedules all configured offsets by absolute time across Asia/Hebron DST changes', () => {
+    for (const offset of [1440, 60, 30, 5] as const) {
+      const start = 1_800_000_000;
+      const reminder = start - offset * 60;
+      expect(isContestReminderDue(start, new Date(reminder * 1000), offset)).toBe(true);
+      expect(isContestReminderDue(start, new Date((reminder + 299) * 1000), offset)).toBe(true);
+      expect(isContestReminderDue(start, new Date((reminder + 300) * 1000), offset))
+        .toBe(offset !== 5);
+      expect(isContestReminderDue(start, new Date((reminder + 301) * 1000), offset)).toBe(false);
+    }
+
+    expect(getLocalDateTime(new Date('2026-03-28T00:01:00Z'))).toEqual({
+      date: '2026-03-28',
+      time: '03:01',
+    });
+    expect(getLocalDateTime(new Date('2026-10-23T23:01:00Z'))).toEqual({
+      date: '2026-10-24',
+      time: '01:01',
+    });
+  });
+
+  it('delivers selected contest reminders once per device inside the scheduled window', async () => {
     const profile = makeProfile();
     const ownerId = 'contest-reminder-client';
     addSubscription(profile.id, ownerId, randomUUID());
     addSubscription(profile.id, ownerId, randomUUID());
     notificationsService.updateSettings(profile.id, {
       contestReminders: true,
+      contestReminderOffsets: [5],
       dailyReminders: false,
       reminderTime: '20:00',
     });
 
-    const now = new Date('2026-01-15T12:00:00.000Z');
-    const start = Math.floor(now.getTime() / 1000) + 10 * 60;
+    const now = new Date('2026-01-15T13:00:00.000Z');
+    const start = Math.floor(now.getTime() / 1000) + 5 * 60;
     vi.spyOn(codeforcesService, 'getOfficialContests').mockResolvedValue([{
       id: 70001,
       name: 'Delayed reminder test round',
@@ -198,9 +231,103 @@ describe('reminder scheduling', () => {
     expect(webpush.sendNotification).toHaveBeenCalledTimes(2);
     const deliveries = db.prepare(`
       SELECT COUNT(*) AS count FROM notification_deliveries
-      WHERE profile_id = ? AND notification_key = 'contest:70001' AND status = 'SENT'
-    `).get(profile.id);
+      WHERE profile_id = ? AND notification_key = ? AND status = 'SENT'
+    `).get(profile.id, `contest:70001:${start}:5`);
     expect(deliveries).toMatchObject({ count: 2 });
+    const payload = JSON.parse(String(vi.mocked(webpush.sendNotification).mock.calls[0]?.[1]));
+    expect(payload.body).toContain('starts in 5 minutes');
+    expect(payload.tag).toBe(`contest-70001-${start}-5`);
+  });
+
+  it('rejects invalid contest reminder offsets without changing stored preferences', () => {
+    const profile = makeProfile();
+    expect(() => notificationsService.updateSettings(profile.id, {
+      contestReminders: true,
+      contestReminderOffsets: [5, 5],
+      dailyReminders: false,
+      reminderTime: '20:00',
+    })).toThrow('Contest reminder offsets are invalid');
+    expect(notificationsService.getSettings(profile.id).contestReminderOffsets).toEqual([30]);
+  });
+
+  it('retries failed contest reminders after the delivery window while the contest is still upcoming', async () => {
+    const profile = makeProfile();
+    addSubscription(profile.id, 'contest-retry-client', randomUUID());
+    notificationsService.updateSettings(profile.id, {
+      contestReminders: true,
+      contestReminderOffsets: [30],
+      dailyReminders: false,
+      reminderTime: '20:00',
+    });
+    const now = new Date('2026-01-15T14:00:00.000Z');
+    const start = Math.floor(now.getTime() / 1000) + 30 * 60;
+    vi.spyOn(codeforcesService, 'getOfficialContests').mockResolvedValue([{
+      id: 70002,
+      name: 'Retry test round',
+      startTimeSeconds: start,
+      durationSeconds: 7200,
+      phase: 'BEFORE',
+    }]);
+    vi.mocked(webpush.sendNotification)
+      .mockRejectedValueOnce(Object.assign(new Error('Temporary push failure'), { statusCode: 503 }));
+
+    await notificationsService.runScheduledJobs(now);
+    await notificationsService.runScheduledJobs(new Date(now.getTime() + 16 * 60_000));
+
+    expect(webpush.sendNotification).toHaveBeenCalledTimes(2);
+    expect(db.prepare(`
+      SELECT status FROM notification_deliveries
+      WHERE profile_id = ? AND notification_key = ?
+    `).get(profile.id, `contest:70002:${start}:30`)).toMatchObject({ status: 'SENT' });
+  });
+
+  it('re-arms contest reminders when the contest start changes and suppresses cancelled contests', async () => {
+    const profile = makeProfile();
+    addSubscription(profile.id, 'contest-update-client', randomUUID());
+    notificationsService.updateSettings(profile.id, {
+      contestReminders: true,
+      contestReminderOffsets: [30],
+      dailyReminders: false,
+      reminderTime: '20:00',
+    });
+    const firstNow = new Date('2026-01-15T13:00:00Z');
+    const firstStart = Math.floor(firstNow.getTime() / 1000) + 30 * 60;
+    const updatedNow = new Date(firstNow.getTime() + 10 * 60_000);
+    const updatedStart = Math.floor(updatedNow.getTime() / 1000) + 30 * 60;
+    const contests = vi.spyOn(codeforcesService, 'getOfficialContests')
+      .mockResolvedValueOnce([{
+        id: 70004,
+        name: 'Updated contest',
+        startTimeSeconds: firstStart,
+        durationSeconds: 7200,
+        phase: 'BEFORE',
+      }])
+      .mockResolvedValueOnce([{
+        id: 70004,
+        name: 'Updated contest',
+        startTimeSeconds: updatedStart,
+        durationSeconds: 7200,
+        phase: 'BEFORE',
+      }])
+      .mockResolvedValueOnce([]);
+
+    db.prepare("DELETE FROM sync_meta WHERE key = 'last_notification_contest_refresh'").run();
+    await notificationsService.runScheduledJobs(firstNow);
+    await notificationsService.runScheduledJobs(updatedNow);
+    await notificationsService.runScheduledJobs(new Date(updatedNow.getTime() + 10 * 60_000));
+
+    expect(contests).toHaveBeenCalledTimes(3);
+    expect(webpush.sendNotification).toHaveBeenCalledTimes(2);
+    const deliveries = db.prepare(`
+      SELECT notification_key, status FROM notification_deliveries
+      WHERE profile_id = ? AND notification_key LIKE 'contest:70004:%'
+      ORDER BY notification_key
+    `).all(profile.id);
+    expect(deliveries).toEqual([
+      { notification_key: `contest:70004:${firstStart}:30`, status: 'SENT' },
+      { notification_key: `contest:70004:${updatedStart}:30`, status: 'SENT' },
+    ]);
+    db.prepare("DELETE FROM sync_meta WHERE key = 'last_notification_contest_refresh'").run();
   });
 
   it('sends a delayed daily reminder with the actual incomplete count after checking current accepted submissions', async () => {

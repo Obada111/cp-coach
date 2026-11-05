@@ -1,5 +1,10 @@
 import { db, getProfileById, getPublicProfileOwner } from './db.js';
-import { getLocalDateTime, isValidPushSubscription, pushEndpointHash } from './notificationsService.js';
+import {
+  getLocalDateTime,
+  isValidPushSubscription,
+  parseContestReminderOffsets,
+  pushEndpointHash,
+} from './notificationsService.js';
 import type { NotificationSettings } from './notificationsService.js';
 
 interface CloudflareConfiguration {
@@ -15,8 +20,29 @@ interface DailyNotificationProblem {
 
 interface NotificationSettingsInput {
   contestReminders: boolean;
+  contestReminderOffsets: number[];
   dailyReminders: boolean;
   reminderTime: string;
+}
+
+export interface NotificationWorkerHealth {
+  status: string;
+  storageReady: boolean;
+  apiSecretConfigured: boolean;
+  vapidConfigured: boolean;
+  vapidPublicKey: string | null;
+  schedulerHealthy: boolean;
+  state?: {
+    last_status?: string | null;
+    last_success_at?: string | null;
+  } | null;
+  latestRun?: {
+    status?: string;
+    started_at?: string;
+    notifications_sent?: number;
+    pushes_attempted?: number;
+    error_code?: string | null;
+  } | null;
 }
 
 export class CloudflareNotificationRepository {
@@ -29,6 +55,40 @@ export class CloudflareNotificationRepository {
     return this.getConfiguration() !== null;
   }
 
+  async getHealth(): Promise<NotificationWorkerHealth> {
+    const configuration = this.getConfiguration();
+    if (!configuration) throw new Error('Cloudflare notification storage is not configured');
+
+    let response: Response;
+    try {
+      response = await this.request(`${configuration.url}/internal/v1/status`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${configuration.apiSecret}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: '{}',
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch {
+      throw new Error('Could not reach the Cloudflare notification worker');
+    }
+
+    if (response.status === 401) throw new Error('The backend API_SECRET does not match the notification worker API_SECRET.');
+    if (!response.ok) throw new Error(`Notification worker health check returned HTTP ${response.status}`);
+    const health: unknown = await response.json();
+    if (
+      !health ||
+      typeof health !== 'object' ||
+      !('status' in health) ||
+      !('storageReady' in health) ||
+      !('apiSecretConfigured' in health) ||
+      !('vapidConfigured' in health)
+    ) throw new Error('Notification worker returned incomplete health information');
+    return health as NotificationWorkerHealth;
+  }
+
   async getSettings(profileId: string, ownerId: string, handle: string): Promise<NotificationSettings> {
     await this.ensureProfile(profileId, ownerId, handle);
     const result = await this.requestJson<{ settings?: NotificationSettings }>(
@@ -36,7 +96,9 @@ export class CloudflareNotificationRepository {
       { profileId, ownerId, handle },
     );
     if (!result.settings) throw new Error('Notification settings were not returned by the notification service');
-    return result.settings;
+    const contestReminderOffsets = parseContestReminderOffsets(result.settings.contestReminderOffsets);
+    if (!contestReminderOffsets) throw new Error('Notification service returned invalid contest reminder offsets');
+    return { ...result.settings, contestReminderOffsets };
   }
 
   async updateSettings(
@@ -51,7 +113,9 @@ export class CloudflareNotificationRepository {
       { profileId, ownerId, handle, ...settings },
     );
     if (!result.settings) throw new Error('Updated notification settings were not returned by the notification service');
-    return result.settings;
+    const contestReminderOffsets = parseContestReminderOffsets(result.settings.contestReminderOffsets);
+    if (!contestReminderOffsets) throw new Error('Notification service returned invalid contest reminder offsets');
+    return { ...result.settings, contestReminderOffsets };
   }
 
   async registerSubscription(

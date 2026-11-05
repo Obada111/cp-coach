@@ -38,6 +38,7 @@ export interface CFProblem {
 export interface UserProfile {
   id: string;
   handle: string;
+  ownerId?: string | null;
   displayName: string;
   avatar?: string | null;
   rating?: number | null;

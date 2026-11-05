@@ -1,6 +1,7 @@
 import {
   applyAcceptedSubmissions,
   countUnfinished,
+  formatContestReminderLead,
   getLocalDateTime,
   isDailySnapshotUsable,
   parseDailySnapshot,
@@ -12,7 +13,8 @@ import type { Env, NotificationTask, WorkerStats } from './types';
 const CONTEST_REFRESH_MS = 5 * 60_000;
 const CODEFORCES_STATUS_COUNT = 3000;
 const RETRY_DELAY_MS = 15 * 60_000;
-const MAX_PUSHES_PER_CRON = 1;
+const MAX_PUSHES_PER_CRON = 10;
+const MAX_TASKS_PER_CRON = 20;
 
 interface CodeforcesContest {
   id?: number;
@@ -98,6 +100,7 @@ async function fetchAcceptedProblems(handle: string): Promise<Set<string>> {
 }
 
 function contestPayload(task: NotificationTask): Record<string, unknown> {
+  if (!task.reminderOffsetMinutes) throw new Error('Contest reminder offset was missing from the scheduled task');
   const start = new Date(Number(task.startTimeSeconds) * 1000);
   const time = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Asia/Hebron',
@@ -106,10 +109,10 @@ function contestPayload(task: NotificationTask): Record<string, unknown> {
   }).format(start);
   return {
     title: 'Upcoming Codeforces contest',
-    body: `${task.contestName} (Codeforces) starts at ${time} (Asia/Hebron).`,
+    body: `${task.contestName} (Codeforces) starts ${formatContestReminderLead(task.reminderOffsetMinutes)} at ${time} (Asia/Hebron).`,
     icon: '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
-    tag: `contest-${task.contestId}`,
+    tag: `contest-${task.contestId}-${task.startTimeSeconds}-${task.reminderOffsetMinutes}`,
     data: { url: `https://codeforces.com/contest/${task.contestId}` },
     actions: [{ action: 'open', title: 'Open contest' }],
   };
@@ -229,18 +232,21 @@ export async function runScheduledWorker(
   await store.recordRun(runId, { startedAt, status: 'RUNNING' });
   try {
     const contestRefreshSucceeded = await refreshContestsIfNeeded(store, now);
-    let task: NotificationTask | null = contestRefreshSucceeded
-      ? await store.findContestTask(now)
-      : null;
     const localTime = getLocalDateTime(now);
-    if (!task) task = await store.findDailyTask(now, localTime.date, localTime.time);
-
-    if (task) {
-      profilesChecked = 1;
+    const checkedProfiles = new Set<string>();
+    let taskCount = 0;
+    while (taskCount < MAX_TASKS_PER_CRON && pushesAttempted < MAX_PUSHES_PER_CRON) {
+      const contestTask = contestRefreshSucceeded ? await store.findContestTask(now) : null;
+      const dailyTask = await store.findDailyTask(now, localTime.date, localTime.time);
+      const task: NotificationTask | null = contestTask ?? dailyTask;
+      if (!task) break;
+      checkedProfiles.add(task.profile.profile_id);
+      taskCount += 1;
       const delivery = await sendTask(store, task, env, now);
-      if (delivery !== 'SKIPPED') pushesAttempted = MAX_PUSHES_PER_CRON;
-      if (delivery === 'SENT') notificationsSent = 1;
+      if (delivery !== 'SKIPPED') pushesAttempted += 1;
+      if (delivery === 'SENT') notificationsSent += 1;
     }
+    profilesChecked = checkedProfiles.size;
 
     const completedAt = new Date().toISOString();
     const durationMs = performance.now() - started;

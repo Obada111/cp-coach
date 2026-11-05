@@ -7,12 +7,18 @@ import type { CFSubmission } from './types.js';
 export const NOTIFICATION_TIMEZONE = 'Asia/Hebron';
 const CONTEST_REFRESH_MS = 5 * 60 * 1000;
 const WORKER_INTERVAL_MS = 5 * 60 * 1000;
+const CONTEST_REMINDER_WINDOW_SECONDS = 5 * 60;
 const RETRY_DELAY_MS = 15 * 60 * 1000;
 const CLAIM_TIMEOUT_MS = 15 * 60 * 1000;
 const DAILY_ACCEPTED_COUNT = 3000;
 
+export const CONTEST_REMINDER_OFFSETS_MINUTES = [1440, 60, 30, 5] as const;
+export type ContestReminderOffsetMinutes = typeof CONTEST_REMINDER_OFFSETS_MINUTES[number];
+const CONTEST_REMINDER_OFFSET_SET = new Set<number>(CONTEST_REMINDER_OFFSETS_MINUTES);
+
 export interface NotificationSettings {
   contestReminders: boolean;
+  contestReminderOffsets: ContestReminderOffsetMinutes[];
   dailyReminders: boolean;
   reminderTime: string;
   timezone: string;
@@ -53,10 +59,40 @@ export function getLocalDateTime(date: Date, timeZone = NOTIFICATION_TIMEZONE): 
   };
 }
 
-export function isContestReminderDue(startTimeSeconds: number, now: Date): boolean {
+export function parseContestReminderOffsets(value: unknown): ContestReminderOffsetMinutes[] | null {
+  let offsets = value;
+  if (typeof offsets === 'string') {
+    try {
+      offsets = JSON.parse(offsets);
+    } catch {
+      return null;
+    }
+  }
+  if (
+    !Array.isArray(offsets) ||
+    offsets.length > CONTEST_REMINDER_OFFSETS_MINUTES.length ||
+    offsets.some((offset) => !Number.isSafeInteger(offset) || !CONTEST_REMINDER_OFFSET_SET.has(offset)) ||
+    new Set(offsets).size !== offsets.length
+  ) return null;
+  return [...offsets].sort((left: number, right: number) => right - left) as ContestReminderOffsetMinutes[];
+}
+
+export function isContestReminderDue(
+  startTimeSeconds: number,
+  now: Date,
+  offsetMinutes: ContestReminderOffsetMinutes = 30,
+): boolean {
   const nowSeconds = Math.floor(now.getTime() / 1000);
-  const reminderTime = startTimeSeconds - 30 * 60;
-  return nowSeconds >= reminderTime && nowSeconds < startTimeSeconds;
+  const reminderTime = startTimeSeconds - offsetMinutes * 60;
+  return nowSeconds >= reminderTime &&
+    nowSeconds <= reminderTime + CONTEST_REMINDER_WINDOW_SECONDS &&
+    nowSeconds < startTimeSeconds;
+}
+
+export function formatContestReminderLead(offsetMinutes: ContestReminderOffsetMinutes): string {
+  if (offsetMinutes === 1440) return 'in 24 hours';
+  if (offsetMinutes === 60) return 'in 1 hour';
+  return `in ${offsetMinutes} minutes`;
 }
 
 function isValidReminderTime(value: unknown): value is string {
@@ -156,16 +192,20 @@ export class NotificationsService {
       VALUES (?)
     `).run(profileId);
     const row = db.prepare(`
-      SELECT contest_reminders, daily_reminders, reminder_time
+      SELECT contest_reminders, contest_reminder_offsets, daily_reminders, reminder_time
       FROM notification_settings
       WHERE profile_id = ?
     `).get(profileId) as {
       contest_reminders: number;
+      contest_reminder_offsets: string;
       daily_reminders: number;
       reminder_time: string;
     };
+    const contestReminderOffsets = parseContestReminderOffsets(row.contest_reminder_offsets);
+    if (!contestReminderOffsets) throw new Error('Stored contest reminder offsets are invalid');
     return {
       contestReminders: Boolean(row.contest_reminders),
+      contestReminderOffsets,
       dailyReminders: Boolean(row.daily_reminders),
       reminderTime: row.reminder_time,
       timezone: NOTIFICATION_TIMEZONE,
@@ -174,24 +214,38 @@ export class NotificationsService {
 
   updateSettings(
     profileId: string,
-    settings: { contestReminders: boolean; dailyReminders: boolean; reminderTime: string }
+    settings: {
+      contestReminders: boolean;
+      contestReminderOffsets?: unknown;
+      dailyReminders: boolean;
+      reminderTime: string;
+    }
   ): NotificationSettings {
     if (typeof settings.contestReminders !== 'boolean' || typeof settings.dailyReminders !== 'boolean') {
       throw new Error('Reminder settings must be boolean values');
     }
+    const contestReminderOffsets = parseContestReminderOffsets(settings.contestReminderOffsets ?? [30]);
+    if (!contestReminderOffsets) throw new Error('Contest reminder offsets are invalid');
     if (!isValidReminderTime(settings.reminderTime)) {
       throw new Error('Reminder time must use 24-hour HH:mm format');
     }
     db.prepare(`
       INSERT INTO notification_settings
-        (profile_id, contest_reminders, daily_reminders, reminder_time, updated_at)
-      VALUES (?, ?, ?, ?, datetime('now'))
+        (profile_id, contest_reminders, contest_reminder_offsets, daily_reminders, reminder_time, updated_at)
+      VALUES (?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT(profile_id) DO UPDATE SET
         contest_reminders = excluded.contest_reminders,
+        contest_reminder_offsets = excluded.contest_reminder_offsets,
         daily_reminders = excluded.daily_reminders,
         reminder_time = excluded.reminder_time,
         updated_at = datetime('now')
-    `).run(profileId, settings.contestReminders ? 1 : 0, settings.dailyReminders ? 1 : 0, settings.reminderTime);
+    `).run(
+      profileId,
+      settings.contestReminders ? 1 : 0,
+      JSON.stringify(contestReminderOffsets),
+      settings.dailyReminders ? 1 : 0,
+      settings.reminderTime,
+    );
     return this.getSettings(profileId);
   }
 
@@ -287,7 +341,8 @@ export class NotificationsService {
   private async executeScheduledJobs(now: Date): Promise<void> {
     this.recoverAbandonedDeliveries(now);
     const settings = db.prepare(`
-      SELECT p.id AS profile_id, p.handle, ns.contest_reminders, ns.daily_reminders, ns.reminder_time
+      SELECT p.id AS profile_id, p.handle, ns.contest_reminders,
+        ns.contest_reminder_offsets, ns.daily_reminders, ns.reminder_time
       FROM profiles p
       JOIN notification_settings ns ON ns.profile_id = p.id
       WHERE (ns.contest_reminders = 1 OR ns.daily_reminders = 1)
@@ -300,10 +355,13 @@ export class NotificationsService {
       ) {
         throw new Error('Stored notification settings are invalid');
       }
+      const contestReminderOffsets = parseContestReminderOffsets(row.contest_reminder_offsets);
+      if (!contestReminderOffsets) throw new Error('Stored contest reminder offsets are invalid');
       return {
         profile_id: row.profile_id,
         handle: row.handle,
         contest_reminders: Number(row.contest_reminders),
+        contest_reminder_offsets: contestReminderOffsets,
         daily_reminders: Number(row.daily_reminders),
         reminder_time: row.reminder_time,
       };
@@ -405,7 +463,10 @@ export class NotificationsService {
   }
 
   private async sendDueContestReminders(
-    profiles: Array<ReminderProfile & { contest_reminders: number }>,
+    profiles: Array<ReminderProfile & {
+      contest_reminders: number;
+      contest_reminder_offsets: ContestReminderOffsetMinutes[];
+    }>,
     subscriptionsByProfile: ReturnType<NotificationsService['loadSubscriptions']>,
     now: Date
   ): Promise<void> {
@@ -420,31 +481,38 @@ export class NotificationsService {
       phase: string | null;
     }>;
     for (const contest of upcoming) {
-      if (!isContestReminderDue(contest.start_time_seconds, now)) continue;
-      const start = new Date(contest.start_time_seconds * 1000);
-      const startTime = new Intl.DateTimeFormat('en-GB', {
-        timeZone: NOTIFICATION_TIMEZONE,
-        dateStyle: 'medium',
-        timeStyle: 'short',
-      }).format(start);
-      const payload = {
-        title: `Upcoming Codeforces contest`,
-        body: `${contest.name} starts at ${startTime} (${NOTIFICATION_TIMEZONE}).`,
-        icon: '/icons/icon-192.png',
-        badge: '/icons/icon-192.png',
-        tag: `contest-${contest.contest_id}`,
-        data: { url: `https://codeforces.com/contest/${contest.contest_id}` },
-        actions: [{ action: 'open', title: 'Open contest' }],
-      };
       for (const profile of profiles) {
         if (!profile.contest_reminders) continue;
-        await this.deliverToProfile(
-          profile.profile_id,
-          subscriptionsByProfile.get(profile.profile_id) || [],
-          `contest:${contest.contest_id}`,
-          payload,
-          now
-        );
+        for (const offset of profile.contest_reminder_offsets) {
+          const notificationKey = `contest:${contest.contest_id}:${contest.start_time_seconds}:${offset}`;
+          const subscriptions = subscriptionsByProfile.get(profile.profile_id) || [];
+          if (
+            !isContestReminderDue(contest.start_time_seconds, now, offset) &&
+            !this.hasRetryableDelivery(profile.profile_id, subscriptions, notificationKey, now)
+          ) continue;
+          const start = new Date(contest.start_time_seconds * 1000);
+          const startTime = new Intl.DateTimeFormat('en-GB', {
+            timeZone: NOTIFICATION_TIMEZONE,
+            dateStyle: 'medium',
+            timeStyle: 'short',
+          }).format(start);
+          const payload = {
+            title: 'Upcoming Codeforces contest',
+            body: `${contest.name} starts ${formatContestReminderLead(offset)} at ${startTime} (${NOTIFICATION_TIMEZONE}).`,
+            icon: '/icons/icon-192.png',
+            badge: '/icons/icon-192.png',
+            tag: `contest-${contest.contest_id}-${contest.start_time_seconds}-${offset}`,
+            data: { url: `https://codeforces.com/contest/${contest.contest_id}` },
+            actions: [{ action: 'open', title: 'Open contest' }],
+          };
+          await this.deliverToProfile(
+            profile.profile_id,
+            subscriptions,
+            notificationKey,
+            payload,
+            now
+          );
+        }
       }
     }
   }
@@ -535,6 +603,24 @@ export class NotificationsService {
       if (!delivery) return true;
       if (delivery.status !== 'FAILED') return false;
       return Boolean(delivery.retry_after && new Date(delivery.retry_after).getTime() <= now.getTime());
+    });
+  }
+
+  private hasRetryableDelivery(
+    profileId: string,
+    subscriptions: Array<{ endpoint_hash: string }>,
+    notificationKey: string,
+    now: Date
+  ): boolean {
+    return subscriptions.some((subscription) => {
+      const delivery = db.prepare(`
+        SELECT status, retry_after FROM notification_deliveries
+        WHERE profile_id = ? AND endpoint_hash = ? AND notification_key = ?
+      `).get(profileId, subscription.endpoint_hash, notificationKey) as
+        | { status: string; retry_after: string | null }
+        | undefined;
+      return delivery?.status === 'FAILED' &&
+        Boolean(delivery.retry_after && Date.parse(delivery.retry_after) <= now.getTime());
     });
   }
 

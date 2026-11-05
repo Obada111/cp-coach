@@ -1,3 +1,4 @@
+import { scopedStorageKey } from './storageScope';
 import { isValidTimestamp, timestampMilliseconds } from './timestamps';
 
 export interface KnowledgeNote {
@@ -14,7 +15,7 @@ export interface KnowledgeNote {
 const KEY_PREFIX = 'cp-coach:knowledge-journal:v1:';
 
 export function knowledgeNotesStorageKey(handle: string): string {
-  return `${KEY_PREFIX}${handle.toLowerCase()}`;
+  return scopedStorageKey(`${KEY_PREFIX}${handle.toLowerCase()}`);
 }
 
 function isKnowledgeNote(value: unknown): value is KnowledgeNote {

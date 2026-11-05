@@ -19,18 +19,19 @@ A personalized Codeforces training dashboard with rule-based weakness analysis, 
 - Saves an offline dashboard snapshot in the browser and supports versioned JSON export/import of public-mode learning state.
 - Installs as a lightweight PWA; only the app shell and static, same-origin assets are cached, never API responses.
 
-## Architecture
+## Architecture ($0.00 / Month Total Cost)
 
-| Part | Technology | Hosting |
-| --- | --- | --- |
-| Frontend | React 18, Vite, TypeScript, Tailwind, Recharts | Vercel Hobby |
-| Backend | Node.js 24, Express, TypeScript, native `node:sqlite` | Render Free |
-| Learning data | Versioned browser-local snapshot plus an ephemeral server copy | Visitor's browser + `/tmp` on Render |
-| Notification data and scheduler | Cloudflare Workers Cron Triggers and D1 | Cloudflare Workers Free |
+| Part | Technology | Hosting | Cost |
+| --- | --- | --- | --- |
+| Frontend | React 18, Vite, TypeScript, Tailwind, Recharts | Vercel Hobby | $0.00 |
+| Backend | Node.js 24, Express, TypeScript, native `node:sqlite` | Render Free Web Service | $0.00 |
+| Durable Database | Supabase Managed PostgreSQL with automatic hydration & sync | Supabase Free Tier | $0.00 |
+| Authentication | Supabase Auth (Passwordless Magic Link & PKCE) | Supabase Free Tier | $0.00 |
+| Notifications & Scheduler | Cloudflare Workers Cron Triggers, D1 & Web Push | Cloudflare Workers Free | $0.00 |
 
-The public backend is intentionally tokenless. The browser sends a random `X-Coach-Client-Id` and the selected `X-Coach-Handle`; the server derives an isolated profile ID from them. A handle is not a password, so the client ID is the browser's access key. Clearing site data loses access to that browser's server-side copy.
+In public mode, every training API request is authenticated with a Supabase access token. The server verifies the token with Supabase on each request and derives the owner only from the verified user id (`sub`); the selected Codeforces handle only chooses among that user's profiles. Passwordless email links are the only sign-in method. Browser-generated client ids are no longer used for authentication, and they are read only for the explicit legacy-data migration flow.
 
-The legacy profile/database API is mounted at `/api/admin` only in public mode and is disabled unless `COACH_ADMIN_TOKEN` is configured. The frontend never receives a server token.
+The backend uses a high-performance hybrid architecture: local SQLite runs in `/tmp` as a sub-millisecond calculation accelerator, while Supabase PostgreSQL acts as the durable cloud source of truth, persisting user state across Render Free container restarts.
 
 ## Local development
 
@@ -67,20 +68,22 @@ TIMEZONE=Asia/Hebron
 
 ## Public deployment
 
-### 1. Backend on Render Free
+See `docs/auth-durable-storage-release.md` for the full release decision, deployment order, backup/restore runbook, and legacy-claim procedure.
+
+### 1. Backend on Render Starter with a persistent disk
 
 Use the included `render.yaml` Blueprint. It:
 
 - builds only the backend,
-- runs with `PUBLIC_MODE=true`,
-- sets `DB_DIR=/tmp/cp_coach` because Render Free storage is ephemeral,
+- runs with `PUBLIC_MODE=true` and requires `SUPABASE_URL` plus `SUPABASE_ANON_KEY`,
+- mounts a 1 GB Render Starter disk at `/var/data/cp_coach` and sets `DB_DIR` there,
+- writes verified daily backups to `/var/data/cp_coach/backups` and fails startup if integrity checks or the startup backup fail,
 - uses `/api/public/health` as the health check,
-- does not create a paid disk,
-- does not set a frontend-visible token.
+- never exposes a server token to the frontend.
 
 After Render creates the service, note its HTTPS URL. Set `CORS_ORIGINS` to the exact Vercel production origin once the frontend exists. `ALLOW_VERCEL_PREVIEWS=true` optionally allows `*.vercel.app` preview origins.
 
-If `CORS_ORIGINS` is unset, the public API accepts browser requests from any origin. That is functional, but setting the exact frontend origin is recommended.
+In production public mode, if `CORS_ORIGINS` is unset the API allows only the built-in production origin. Set `CORS_ORIGINS` to the exact Vercel production origin.
 
 Configure these server-only Render variables after creating the Cloudflare Worker:
 
@@ -97,22 +100,25 @@ Set these Vercel project environment variables:
 ```env
 VITE_PUBLIC_MODE=true
 VITE_API_BASE_URL=https://your-render-service.onrender.com
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-public-anon-key
 ```
 
 Do not add `COACH_API_TOKEN`, `COACH_ADMIN_TOKEN`, or any other server secret to Vercel. The frontend bundle must not contain server credentials.
 
-### 3. Free-tier limitations
+### 3. Durability and account limitations
 
-- Render Free may sleep after inactivity; the first request can take longer.
-- Render Free has no persistent disk. The SQLite file is temporary.
-- The sleeping Render API is used only to synchronize notification settings, subscriptions, and daily snapshots. Cloudflare owns notification persistence and scheduling, so push delivery does not require the Render process or browser to remain online.
-- Each browser stores a versioned snapshot of its own assignments, feedback, notes, reviews, sessions, contests, and goals. The snapshot is restored after a backend restart.
-- Use **Settings → Learning Data Backup** to export all saved handles or import a versioned JSON backup in merge or replace mode. Imports are validated and confirmed before use.
-- Backups are limited to 10 MB; oversized exports fail explicitly instead of silently omitting records. Restores remap browser-owned IDs while preserving shared Codeforces problem identities.
+- Render Starter stays warm and keeps the SQLite database on a persistent disk through deploys and restarts.
+- Server SQLite is authoritative for training data. Browser storage is a cache and an offline convenience; it is not the source of truth.
+- Verified backups are written to the same persistent disk by default. Copy them offsite regularly; same-disk backups do not protect against disk or account loss.
+- Cloudflare owns notification persistence and scheduling, so push delivery does not require the Render process or browser to remain online.
+- A browser snapshot is imported automatically only when the server has no personal rows for that profile, so redeploys cannot overwrite newer server data with a stale cache.
+- Use **Settings → Learning Data Backup** to export your account profiles or import a versioned JSON backup in merge or replace mode. Imports are validated and confirmed before use.
+- Backups are limited to 10 MB; oversized exports fail explicitly instead of silently omitting records. Restores remap account-owned IDs while preserving shared Codeforces problem identities.
 - Weekly reports use seven Asia/Hebron calendar dates and timezone-aware UTC boundaries, including daylight-saving transitions.
 - PWA offline mode can show the last browser-saved dashboard. Codeforces and API data are not presented as current while disconnected.
-- Browser-local data is not synchronized between devices. Two browsers are separate tenants even for the same handle.
-- The service can still lose data if a browser's site data is cleared and the backend is restarted.
+- Training data follows the signed-in account across devices. Local knowledge notes and virtual-contest sessions remain browser-scoped and are moved into the active account by the explicit migration prompt.
+- Clearing browser data no longer deletes server training data. It can still remove unexported browser-only notes and virtual-contest sessions.
 - No keep-alive traffic is generated. Auto-refresh runs only while the page is visible.
 
 ## Push notifications and reminders
@@ -177,8 +183,8 @@ No Cloudflare resource has been created or deployed by this repository. Do not r
 
 - Contest reminders are based on Codeforces' official contest list, cached for five minutes, and selected in the 30-minute pre-start window. Canceled/removed upcoming contests are marked canceled on refresh. Each profile/device/contest has a unique delivery key.
 - Daily reminders default to **20:00 Asia/Hebron**. They require a same-day, fresh D1 snapshot containing at least one recommendation. Immediately before a push, the worker fetches Codeforces submissions and only `OK` accepted submissions count; opening a problem and self-reported completion do not. Missing, invalid, empty, stale, or unverifiable snapshots are skipped.
-- Daily snapshots are synchronized from server-side recommendation/completion state after successful relevant API reads and updates. If Render is asleep or the user has not opened CP Coach after generating new browser-backed recommendations, Cloudflare cannot read localStorage. It skips an unavailable/stale snapshot instead of guessing.
-- A browser-local profile can register multiple device subscriptions. Separate browser profiles are not automatically linked even if they use the same Codeforces handle. Clearing that browser's site data may prevent later preference/subscription management. Existing browser backups remain unchanged.
+- Daily snapshots are synchronized from server-side recommendation/completion state after successful relevant API reads and updates. Cloudflare never reads browser localStorage; an unavailable or stale snapshot is skipped instead of guessed.
+- A signed-in account profile can register multiple device subscriptions. Profiles under the same account are isolated from other accounts, and clearing browser site data no longer removes server subscriptions.
 - Delivery is idempotent in D1, failed deliveries may retry, 404/410 push endpoints are removed, and claims older than 15 minutes are recoverable after a Worker crash. Worker run and heartbeat data are available through `/health` and `notification_worker_runs`.
 - Cleanup retains worker execution rows for 45 days, delivery rows for 180 days, and contest rows for 90 days. The Worker processes at most one push per five-minute run to constrain Free-plan CPU. This is up to **288 pushes/day total**; larger profile/device populations may be delayed and this is not a high-throughput notification service.
 
@@ -210,27 +216,27 @@ No Cloudflare resource has been created or deployed by this repository. Do not r
 4. Close CP Coach and lock the phone. Verify tapping a daily notification opens Daily Recommendations and a contest notification opens its contest. Complete all recommendations before the reminder to verify it is skipped.
 5. Restore the normal reminder time and test disabling reminders/removing the device subscription.
 
-## Browser-local persistence and refresh
+## Account persistence and refresh
 
 - A visible tab refreshes approximately every 120 seconds and refreshes when it becomes visible again.
 - Hidden tabs do not poll.
 - The header shows the last successful update time.
 - A failed refresh keeps the last valid dashboard and shows a notice.
 - The service worker caches only the static app shell and Vite assets. `/api/` and `/health` responses are never cached.
-- A backend restart is detected through the public health endpoint's instance ID; the browser re-uploads its snapshot before loading the dashboard.
-- Successful mutations trigger a debounced context capture. The server copy is a convenience cache, not a permanent account store.
-- The daily set is persisted server-side and restored from the browser snapshot, so a refresh does not regenerate the three recommendations or erase feedback.
+- The durable server database, not the browser, owns training state through restarts and deploys.
+- A local snapshot is imported automatically only when that profile has no personal rows on the server, preventing stale-cache overwrites.
+- Successful mutations trigger a debounced context capture for offline display. The daily set is persisted server-side and a refresh does not regenerate recommendations or erase feedback.
 
 ## API boundary
 
-Public endpoints are under `/api/public`:
+Authenticated training endpoints are under `/api/public`. Except for health, notification config, and public handle validation, every request requires `Authorization: Bearer <Supabase access token>`:
 
-- `GET /health`, `GET /profiles`, `POST /profiles`
-- `POST /profiles/:id/select`, `DELETE /profiles/:id`
-- `GET /handle/validate`
-- `GET /context`, `POST /context`
-- The dashboard, daily, history, journal, contests, tutorials, reviews, sessions, weekly goals, training plan, and skill-track routes, all scoped to the requesting browser profile.
-- `GET/PUT /notifications/settings`, `POST/DELETE /notifications/subscriptions`, and `GET /notifications/config`, scoped to the requesting browser profile.
+- `GET /health`, `GET /handle/validate`, `GET /notifications/config` are public
+- `GET /profiles`, `POST /profiles`, `POST /profiles/claim-legacy` require authentication
+- `POST /profiles/:id/select`, `DELETE /profiles/:id` require authentication
+- `GET /context`, `POST /context` require authentication and are scoped to the account profile
+- The dashboard, daily, history, journal, contests, tutorials, reviews, sessions, weekly goals, training plan, and skill-track routes, all scoped to the authenticated account profile.
+- `GET/PUT /notifications/settings` and `POST/DELETE /notifications/subscriptions`, scoped to the authenticated account profile.
 
 The public API applies:
 
@@ -303,7 +309,7 @@ cloudflare/notifications-worker/
   migrations/                   Additive notification-only D1 schema
   src/                          Authenticated Worker, scheduler, and native Web Push
 vercel.json                    Vercel build and SPA routing
-render.yaml                    Render Free Blueprint
+render.yaml                    Render Starter Blueprint with persistent disk
 .env.example                   Local environment reference
 .env.production.example        Public deployment reference
 ```
@@ -311,13 +317,13 @@ render.yaml                    Render Free Blueprint
 ## Privacy
 
 - No Codeforces password or API key is requested.
-- Private notes and feedback are scoped to the browser's random client ID.
+- Private notes and feedback are scoped to the verified Supabase account id; the server never trusts a browser-supplied client id as identity.
 - Never commit `*.db`, WAL files, backups, logs, or real environment files.
 - The public frontend contains no server token.
 
 ## Troubleshooting
 
 - **Codeforces rate limiting (HTTP 429):** cached data is served; retries back off automatically.
-- **First request after inactivity is slow:** Render Free is waking up. The page shows loading/error states rather than discarding the last valid data.
+- **First request is slow:** Codeforces or the authentication service may be responding slowly. The page shows loading/error states rather than discarding the last valid data.
 - **Empty recommendations on a fresh backend:** wait for the automatic Codeforces sync, or use Refresh. The problemset cache rebuilds from the public API.
 - **Port conflict:** change `PORT` or run Vite with `npm run dev -- --port 5174`.

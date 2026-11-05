@@ -5,7 +5,9 @@ import {
   CheckCircle2, 
   Clock, 
   Play,
-  Check
+  Check,
+  AlertCircle,
+  Loader2
 } from 'lucide-react';
 import { ReviewQueueItem, ReviewQueueSummary } from '../types';
 import { actionReview } from '../api';
@@ -14,7 +16,7 @@ interface ReviewQueueCardProps {
   dueReviews: ReviewQueueItem[];
   summary?: ReviewQueueSummary | { dueCount: number; upcomingCount: number; masteredCount: number; totalCount: number };
   profileId: string;
-  onReviewUpdated: () => void;
+  onReviewUpdated: () => void | Promise<void>;
   onStartSession?: (problemId: string) => void;
 }
 
@@ -26,16 +28,31 @@ export const ReviewQueueCard: React.FC<ReviewQueueCardProps> = ({
   onStartSession,
 }) => {
   const [actingId, setActingId] = useState<string | null>(null);
+  const [actingOutcome, setActingOutcome] = useState<'MASTERED' | 'EASY' | 'DIFFICULT' | 'DEFERRED' | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const handleAction = async (problemId: string, outcome: 'MASTERED' | 'EASY' | 'DIFFICULT' | 'DEFERRED') => {
+    setActionError(null);
     setActingId(problemId);
+    setActingOutcome(outcome);
     try {
       await actionReview(problemId, outcome, undefined, profileId);
-      onReviewUpdated();
     } catch (err) {
-      console.error('Failed to submit review outcome:', err);
+      setActionError(err instanceof Error
+        ? err.message
+        : 'Could not save this review. Check your connection and try again.');
+      setActingId(null);
+      setActingOutcome(null);
+      return;
+    }
+
+    try {
+      await onReviewUpdated();
+    } catch {
+      setActionError('Review saved, but the queue could not be refreshed. Reload the page to see the latest schedule.');
     } finally {
       setActingId(null);
+      setActingOutcome(null);
     }
   };
 
@@ -77,6 +94,13 @@ export const ReviewQueueCard: React.FC<ReviewQueueCardProps> = ({
         </div>
       </div>
 
+      {actionError && (
+        <div role="alert" className="mb-4 flex items-start gap-2 rounded-xl border border-rose-900/60 bg-rose-950/30 p-3 text-xs text-rose-200">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+          <span>{actionError}</span>
+        </div>
+      )}
+
       {/* Due Reviews List */}
       {dueReviews.length === 0 ? (
         <div className="flex flex-col items-center justify-center p-8 rounded-xl bg-slate-800/30 border border-dashed border-slate-800 text-center">
@@ -92,6 +116,9 @@ export const ReviewQueueCard: React.FC<ReviewQueueCardProps> = ({
         <div className="space-y-3">
           {dueReviews.map((item) => {
             const isProcessing = actingId === item.problemId;
+            const isSavingEasy = isProcessing && actingOutcome === 'EASY';
+            const isSavingDifficult = isProcessing && actingOutcome === 'DIFFICULT';
+            const isSavingMastered = isProcessing && actingOutcome === 'MASTERED';
             return (
               <div
                 key={item.id}
@@ -135,8 +162,9 @@ export const ReviewQueueCard: React.FC<ReviewQueueCardProps> = ({
                 <div className="flex flex-wrap items-center gap-2 self-start md:self-center">
                   {onStartSession && (
                     <button
+                      disabled={actingId !== null}
                       onClick={() => onStartSession(item.problemId)}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition shadow-sm"
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition shadow-sm disabled:cursor-wait disabled:opacity-50"
                     >
                       <Play className="w-3 h-3 fill-current" />
                       Practice
@@ -144,31 +172,33 @@ export const ReviewQueueCard: React.FC<ReviewQueueCardProps> = ({
                   )}
 
                   <button
-                    disabled={isProcessing}
+                    disabled={actingId !== null}
                     onClick={() => handleAction(item.problemId, 'EASY')}
                     className="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-emerald-950/60 hover:bg-emerald-900/80 text-emerald-300 border border-emerald-800/60 transition disabled:opacity-50"
                     title="Solid solve. Advance interval (e.g. +3d or +7d)"
+                    aria-busy={isSavingEasy}
                   >
-                    Comfortable (+adv)
+                    {isSavingEasy ? <Loader2 className="inline h-3 w-3 animate-spin" /> : 'Comfortable (+adv)'}
                   </button>
 
                   <button
-                    disabled={isProcessing}
+                    disabled={actingId !== null}
                     onClick={() => handleAction(item.problemId, 'DIFFICULT')}
                     className="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-amber-950/60 hover:bg-amber-900/80 text-amber-300 border border-amber-800/60 transition disabled:opacity-50"
                     title="Still shaky. Keep short interval (+1d)"
+                    aria-busy={isSavingDifficult}
                   >
-                    Struggled (+1d)
+                    {isSavingDifficult ? <Loader2 className="inline h-3 w-3 animate-spin" /> : 'Struggled (+1d)'}
                   </button>
 
                   <button
-                    disabled={isProcessing}
+                    disabled={actingId !== null}
                     onClick={() => handleAction(item.problemId, 'MASTERED')}
                     className="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-purple-950/60 hover:bg-purple-900/80 text-purple-300 border border-purple-800/60 transition disabled:opacity-50 flex items-center gap-1"
                     title="Fully mastered pattern"
+                    aria-busy={isSavingMastered}
                   >
-                    <Check className="w-3 h-3" />
-                    Mastered
+                    {isSavingMastered ? <Loader2 className="h-3 w-3 animate-spin" /> : <><Check className="w-3 h-3" /> Mastered</>}
                   </button>
                 </div>
               </div>

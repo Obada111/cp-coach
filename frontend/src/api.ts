@@ -38,6 +38,8 @@ import {
   virtualContestStorageKey,
 } from './virtualContest';
 import { recordRequest } from './perf';
+import { getAuthHeaders, refreshActiveAuthSession } from './authSession';
+import { scopedStorageKey } from './storageScope';
 
 const FALLBACK_PUBLIC_API_ORIGIN = 'https://cp-coach-api-9wk2.onrender.com';
 const configuredApiOrigin = ((import.meta.env.VITE_API_BASE_URL as string | undefined) || '').trim().replace(/\/+$/, '');
@@ -50,14 +52,13 @@ const CLIENT_ID_KEY = 'cp-coach:client-id:v1';
 const HANDLES_KEY = 'cp-coach:handles:v1';
 const ACTIVE_HANDLE_KEY = 'cp-coach:active-handle:v1';
 const CONTEXT_PREFIX = 'cp-coach:context:v1:';
-const SERVER_INSTANCE_KEY = 'cp-coach:server-instance:v1';
 const OFFLINE_SNAPSHOT_KEY = 'cp-coach:offline-dashboard:v1';
 const HANDLE_PATTERN = /^[A-Za-z0-9_.-]{2,64}$/;
 const inFlightPublicRequests = new Map<string, Promise<Response>>();
 
 function readStorage(key: string): string | null {
   try {
-    return window.localStorage.getItem(key);
+    return window.localStorage.getItem(scopedStorageKey(key));
   } catch {
     return null;
   }
@@ -65,7 +66,7 @@ function readStorage(key: string): string | null {
 
 function writeStorage(key: string, value: string): boolean {
   try {
-    window.localStorage.setItem(key, value);
+    window.localStorage.setItem(scopedStorageKey(key), value);
     return true;
   } catch {
     return false;
@@ -74,7 +75,7 @@ function writeStorage(key: string, value: string): boolean {
 
 function removeStorage(key: string): void {
   try {
-    window.localStorage.removeItem(key);
+    window.localStorage.removeItem(scopedStorageKey(key));
   } catch {
     // Storage may be unavailable in private modes.
   }
@@ -94,10 +95,19 @@ function randomClientId(): string {
 }
 
 export function getOrCreateClientId(): string {
-  let clientId = readStorage(CLIENT_ID_KEY);
+  let clientId: string | null = null;
+  try {
+    clientId = window.localStorage.getItem(CLIENT_ID_KEY);
+  } catch {
+    clientId = null;
+  }
   if (!clientId || !/^[A-Za-z0-9_-]{16,128}$/.test(clientId)) {
     clientId = randomClientId();
-    writeStorage(CLIENT_ID_KEY, clientId);
+    try {
+      window.localStorage.setItem(CLIENT_ID_KEY, clientId);
+    } catch {
+      // Legacy migration still works with the in-memory id for this session.
+    }
   }
   return clientId;
 }
@@ -162,15 +172,21 @@ export function clearPublicLocalData(): void {
   currentHandle = null;
 }
 
+export function resetPublicSessionState(): void {
+  currentHandle = null;
+  lastProfiles = [];
+  profileHandleById.clear();
+  lastContextCaptureAt.clear();
+  inFlightPublicRequests.clear();
+}
+
 function publicHeaders(handle: string | null = currentHandle): Record<string, string> {
-  const headers: Record<string, string> = {
-    'X-Coach-Client-Id': getOrCreateClientId(),
-  };
+  const headers: Record<string, string> = getAuthHeaders();
   if (handle) headers['X-Coach-Handle'] = handle;
   return headers;
 }
 
-let currentHandle: string | null = getPublicHandle();
+let currentHandle: string | null = null;
 let lastProfiles: UserProfile[] = [];
 const profileHandleById = new Map<string, string>();
 let captureTimer: ReturnType<typeof setTimeout> | null = null;
@@ -195,10 +211,9 @@ function countPersonalRows(snapshot: any): number {
 function writeContext(handle: string, snapshot: any): void {
   const key = `${CONTEXT_PREFIX}${handle.trim().toLowerCase()}`;
 
-  // Never replace a richer local snapshot with an empty server snapshot. This
-  // can happen if a health check misses a restart and the first dashboard
-  // request lands on a fresh ephemeral database. Keeping the local snapshot
-  // lets the next refresh restore it.
+  // Never replace a richer local cache with a temporarily empty server
+  // snapshot. The durable database is authoritative; this guard only prevents
+  // a transient empty response from erasing useful offline data.
   const existingRaw = readStorage(key);
   if (existingRaw && countPersonalRows(snapshot) === 0) {
     try {
@@ -265,95 +280,50 @@ export async function capturePublicContext(
   return captureInFlight;
 }
 
-let instanceCheck: Promise<boolean> | null = null;
-let lastInstanceCheckAt = 0;
-let pendingServerInstanceId: string | null = null;
-
-function acknowledgeServerInstance(): void {
-  if (pendingServerInstanceId) {
-    writeStorage(SERVER_INSTANCE_KEY, pendingServerInstanceId);
-    pendingServerInstanceId = null;
-  }
-  lastInstanceCheckAt = Date.now();
-}
-
-export async function restorePublicContext(
-  handle: string,
-  mode: BackupMode = 'merge'
-): Promise<{ restored: boolean; failed?: boolean; counts?: Record<string, number> }> {
-  if (!isPublicMode) return { restored: false };
+/**
+ * Safe one-way recovery for pre-durable browser snapshots. It imports the
+ * local snapshot only when the server has no personal rows for that profile,
+ * so a redeploy can never overwrite newer server data with a stale cache.
+ */
+export async function restoreLocalSnapshotIfServerEmpty(
+  handle: string | null = currentHandle,
+): Promise<{ restored: boolean; failed?: boolean }> {
+  if (!isPublicMode || !handle) return { restored: false };
   const key = `${CONTEXT_PREFIX}${handle.trim().toLowerCase()}`;
   const raw = readStorage(key);
-  if (!raw) {
-    acknowledgeServerInstance();
-    return { restored: false };
-  }
+  if (!raw) return { restored: false };
 
-  let context: unknown;
+  let localContext: unknown;
   try {
-    context = JSON.parse(raw);
+    localContext = JSON.parse(raw);
   } catch {
-    acknowledgeServerInstance();
     return { restored: false };
   }
+  if (countPersonalRows(localContext) === 0) return { restored: false };
 
   try {
-    const res = await globalThis.fetch(`${API_BASE}/context`, {
+    const currentResponse = await globalThis.fetch(`${API_BASE}/context`, {
+      headers: publicHeaders(handle),
+      cache: 'no-store',
+    });
+    if (!currentResponse.ok) return { restored: false, failed: true };
+    const serverContext: unknown = await currentResponse.json();
+    if (countPersonalRows(serverContext) > 0) return { restored: false };
+
+    const importResponse = await globalThis.fetch(`${API_BASE}/context`, {
       method: 'POST',
       headers: {
         ...publicHeaders(handle),
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ context, mode }),
+      body: JSON.stringify({ context: localContext, mode: 'merge' }),
     });
-    if (!res.ok) return { restored: false, failed: true };
-    const data = await res.json().catch(() => ({}));
-    acknowledgeServerInstance();
-    return { restored: true, counts: data.counts };
+    return importResponse.ok
+      ? { restored: true }
+      : { restored: false, failed: true };
   } catch {
     return { restored: false, failed: true };
   }
-}
-
-/**
- * Detect a backend restart (Render free instances lose their ephemeral DB).
- * When the instance changes, the caller re-uploads this browser's snapshot
- * before loading the dashboard. The new instance ID is only acknowledged after
- * a successful restore, so a transient failure is retried instead of silently
- * replacing the local snapshot with an empty dashboard.
- */
-export async function serverRestarted(): Promise<boolean> {
-  if (!isPublicMode) return false;
-  if (instanceCheck) return instanceCheck;
-  if (Date.now() - lastInstanceCheckAt < 15_000) return false;
-
-  instanceCheck = (async () => {
-    try {
-      const res = await globalThis.fetch(`${API_BASE}/health`, { cache: 'no-store' });
-      if (!res.ok) return false;
-      const data = await res.json();
-      const instanceId = typeof data.instanceId === 'string' ? data.instanceId : '';
-      if (!instanceId) return false;
-      const previous = readStorage(SERVER_INSTANCE_KEY);
-      if (!previous) {
-        writeStorage(SERVER_INSTANCE_KEY, instanceId);
-        lastInstanceCheckAt = Date.now();
-        return false;
-      }
-      if (previous === instanceId) {
-        lastInstanceCheckAt = Date.now();
-        return false;
-      }
-      pendingServerInstanceId = instanceId;
-      return true;
-    } catch {
-      return false;
-    } finally {
-      instanceCheck = null;
-    }
-  })();
-
-  return instanceCheck;
 }
 
 export function getContextSavedAt(handle: string): string | null {
@@ -415,7 +385,7 @@ export interface OfflineDashboardSnapshot {
 
   export async function exportBrowserData(): Promise<BrowserBackup> {
     if (!isPublicMode) {
-      throw new Error('Browser data export is available in public browser-local mode only.');
+      throw new Error('Browser data export is available in online mode only.');
     }
 
     const handles = Array.from(new Set(
@@ -423,7 +393,7 @@ export interface OfflineDashboardSnapshot {
         .map((handle) => handle.trim())
         .filter((handle) => HANDLE_PATTERN.test(handle))
     )).slice(0, 10);
-    if (handles.length === 0) throw new Error('There is no browser-local profile data to export yet.');
+    if (handles.length === 0) throw new Error('There is no account profile data to export yet.');
 
     const profiles = [];
     for (const handle of handles) {
@@ -470,11 +440,11 @@ export interface OfflineDashboardSnapshot {
 
   export async function importBrowserData(rawBackup: unknown, mode: BackupMode): Promise<void> {
     if (!isPublicMode) {
-      throw new Error('Browser data restore is available in public browser-local mode only.');
+      throw new Error('Browser data restore is available in online mode only.');
     }
     if (mode !== 'merge' && mode !== 'replace') throw new Error('Import mode must be merge or replace.');
     const backup = validateBrowserBackup(rawBackup);
-    const savedHandlesRaw = window.localStorage.getItem(HANDLES_KEY);
+    const savedHandlesRaw = window.localStorage.getItem(scopedStorageKey(HANDLES_KEY));
     if (savedHandlesRaw) {
       let existingHandles: unknown;
       try {
@@ -495,10 +465,10 @@ export interface OfflineDashboardSnapshot {
       backup.profiles.map(({ handle }) => [handle.toLowerCase(), listVirtualContestSessions(handle)])
     );
     const affectedKeys = [
-      HANDLES_KEY,
-      ACTIVE_HANDLE_KEY,
+      scopedStorageKey(HANDLES_KEY),
+      scopedStorageKey(ACTIVE_HANDLE_KEY),
       ...backup.profiles.flatMap(({ handle, virtualContests }) => [
-        `${CONTEXT_PREFIX}${handle.toLowerCase()}`,
+        scopedStorageKey(`${CONTEXT_PREFIX}${handle.toLowerCase()}`),
         knowledgeNotesStorageKey(handle),
         ...(currentVirtualByHandle.get(handle.toLowerCase()) || [])
           .map((session) => virtualContestStorageKey(handle, session.contestId)),
@@ -521,7 +491,7 @@ export interface OfflineDashboardSnapshot {
 
     const prepared = backup.profiles.map((entry) => {
       const { handle, context } = entry;
-      const key = `${CONTEXT_PREFIX}${handle.toLowerCase()}`;
+      const key = scopedStorageKey(`${CONTEXT_PREFIX}${handle.toLowerCase()}`);
       const existingRaw = window.localStorage.getItem(key);
       let existingContext: Record<string, unknown> | null = null;
       let knowledgeNotes = entry.knowledgeNotes;
@@ -674,10 +644,10 @@ export interface OfflineDashboardSnapshot {
       });
 
       const localChanges = new Map<string, string | null>();
-      localChanges.set(HANDLES_KEY, JSON.stringify(newHandles));
+      localChanges.set(scopedStorageKey(HANDLES_KEY), JSON.stringify(newHandles));
       for (const { handle, knowledgeNotes, virtualContests, currentVirtual } of prepared) {
         localChanges.set(
-          `${CONTEXT_PREFIX}${handle.toLowerCase()}`,
+          scopedStorageKey(`${CONTEXT_PREFIX}${handle.toLowerCase()}`),
           JSON.stringify(canonicalContexts.get(handle))
         );
         localChanges.set(knowledgeNotesStorageKey(handle), JSON.stringify(knowledgeNotes));
@@ -778,10 +748,10 @@ function scheduleContextCapture(): void {
 }
 
 /**
- * One transport boundary for both modes. Public requests carry a random
- * browser ID and the selected handle; no server token is ever shipped to the
- * browser. Profile IDs are rewritten server-side, so old component code can
- * keep passing them without leaking another browser's data.
+ * One transport boundary for both modes. Public requests carry the Supabase
+ * Bearer token and the selected handle; no server secret is ever shipped to
+ * the browser. Profile IDs are rewritten server-side, so old component code
+ * can keep passing them without leaking another account's data.
  */
 const apiFetch: typeof globalThis.fetch = (input, init) => {
   if (!isPublicMode) {
@@ -817,7 +787,9 @@ const apiFetch: typeof globalThis.fetch = (input, init) => {
   }
 
   const headers = new Headers(init?.headers);
-  headers.set('X-Coach-Client-Id', getOrCreateClientId());
+  for (const [name, value] of Object.entries(getAuthHeaders())) {
+    if (!headers.has(name)) headers.set(name, value);
+  }
   if (currentHandle) headers.set('X-Coach-Handle', currentHandle);
 
   const method = (init?.method || 'GET').toUpperCase();
@@ -884,6 +856,15 @@ const apiFetch: typeof globalThis.fetch = (input, init) => {
           status: response.status,
           serverTiming: response.headers.get('server-timing'),
         });
+        if (response.status === 401 && headers.has('Authorization') && attempt === 0) {
+          const refreshed = await refreshActiveAuthSession();
+          if (refreshed) {
+            for (const [name, value] of Object.entries(getAuthHeaders())) {
+              headers.set(name, value);
+            }
+            continue;
+          }
+        }
         if (isRead && [502, 503, 504].includes(response.status) && attempt < 2) {
           await new Promise((resolve) => window.setTimeout(resolve, 700 * (attempt + 1)));
           continue;
@@ -985,6 +966,40 @@ export async function selectProfile(profileId: string): Promise<{ success: boole
     throw new Error(err.error || 'Failed to switch profile');
   }
   return res.json();
+}
+
+export interface LegacyClaimResult {
+  success: boolean;
+  dryRun: boolean;
+  alreadyOwned: boolean;
+  migrationId: string | null;
+  profile: UserProfile;
+  previousOwnerId: string | null;
+  migratedCounts: Record<string, number>;
+  warnings: string[];
+  message: string;
+}
+
+export async function claimLegacyProfile(input: {
+  handle: string;
+  legacyOwnerId?: string;
+  claimSecret?: string;
+  dryRun?: boolean;
+}): Promise<LegacyClaimResult> {
+  const res = await fetch(`${API_BASE}/profiles/claim-legacy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Could not claim the legacy profile (HTTP ${res.status}).`);
+  }
+  if (!data.dryRun && data.profile?.handle) {
+    setPublicHandle(data.profile.handle);
+    rememberProfiles([data.profile]);
+  }
+  return data as LegacyClaimResult;
 }
 
 export async function deleteProfile(profileId: string): Promise<{ success: boolean; message: string }> {
@@ -1438,6 +1453,7 @@ export async function fetchHealth(): Promise<{ status: string; timestamp: string
 
 export interface NotificationSettings {
   contestReminders: boolean;
+  contestReminderOffsets: number[];
   dailyReminders: boolean;
   reminderTime: string;
   timezone: string;
@@ -1447,6 +1463,26 @@ export interface NotificationAvailability {
   available: boolean;
   vapidPublicKey: string | null;
   timezone: string;
+  readiness?: {
+    storage: { configured: boolean; ready: boolean; detail: string };
+    vapid: { configured: boolean; matchesWorker: boolean | null; detail: string };
+    worker: {
+      configured: boolean;
+      reachable: boolean;
+      apiSecretConfigured: boolean;
+      schedulerHealthy: boolean | null;
+      lastStatus: string | null;
+      lastSuccessAt: string | null;
+      lastRun: {
+        status?: string;
+        started_at?: string;
+        notifications_sent?: number;
+        pushes_attempted?: number;
+        error_code?: string | null;
+      } | null;
+      detail: string;
+    };
+  };
 }
 
 export async function fetchNotificationAvailability(): Promise<NotificationAvailability> {
@@ -1473,7 +1509,7 @@ export async function isPushSubscriptionRegistered(endpoint: string): Promise<bo
 }
 
 export async function saveNotificationSettings(
-  settings: Pick<NotificationSettings, 'contestReminders' | 'dailyReminders' | 'reminderTime'>
+  settings: Pick<NotificationSettings, 'contestReminders' | 'contestReminderOffsets' | 'dailyReminders' | 'reminderTime'>
 ): Promise<NotificationSettings> {
   const res = await fetch(`${API_BASE}/notifications/settings`, {
     method: 'PUT',

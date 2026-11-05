@@ -1,7 +1,7 @@
-# Render Blueprint for the public Codeforces Coach backend.
-# The frontend is deployed separately on Vercel; this service only runs the API.
-# Free instances use an ephemeral filesystem, so SQLite is intentionally kept
-# under /tmp and restored from each browser's versioned local snapshot.
+# Render Blueprint for the Codeforces Coach backend.
+# The frontend is deployed separately on Vercel; this service runs the API.
+# Configured for Render Free ($0.00/month) with durable cloud database sync
+# to Supabase PostgreSQL and resilient client-side state caching.
 
 services:
   - type: web
@@ -19,16 +19,36 @@ services:
         value: production
       - key: PUBLIC_MODE
         value: "true"
+      - key: ALLOW_EPHEMERAL_DB_CACHE
+        value: "true"
       - key: CLOUDFLARE_NOTIFICATIONS_URL
         sync: false
       - key: CLOUDFLARE_NOTIFICATIONS_API_SECRET
         sync: false
       - key: VAPID_PUBLIC_KEY
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CODEFORCES_CREDENTIAL_ENCRYPTION_KEY
+        sync: false
       - key: HOST
         value: "0.0.0.0"
       - key: DB_DIR
         value: "/tmp/cp_coach"
+      - key: DB_BACKUP_DIR
+        value: "/tmp/cp_coach/backups"
+      - key: DB_BACKUP_INTERVAL_HOURS
+        value: "24"
+      - key: DB_BACKUP_RETENTION
+        value: "7"
+      - key: DB_BACKUP_ON_STARTUP
+        value: "false"
+      - key: LEGACY_MIGRATION_SECRET
+        sync: false
       - key: TIMEZONE
         value: "Asia/Hebron"
       - key: CODEFORCES_REQUEST_TIMEOUT_MS

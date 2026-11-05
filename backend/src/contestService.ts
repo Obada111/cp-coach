@@ -1,4 +1,5 @@
 import { db, getProfileById, getProfileByHandle } from './db.js';
+import { requestCodeforcesUrl } from './codeforcesApi.js';
 import { tutorialService } from './tutorialService.js';
 import {
   UserContestSummary,
@@ -15,6 +16,8 @@ import {
 } from './types.js';
 import { problemJournalService } from './problemJournalService.js';
 
+const CF_API_BASE = 'https://codeforces.com/api';
+
 export function extractDivision(name: string): string {
   if (!name) return 'Other';
   if (/div\.\s*1\s*\+\s*div\.\s*2/i.test(name) || /div\s*1\s*\+\s*2/i.test(name)) return 'Div. 1 + Div. 2';
@@ -27,33 +30,8 @@ export function extractDivision(name: string): string {
   return 'Other';
 }
 
-const CF_API_BASE = 'https://codeforces.com/api';
-const MIN_INTERVAL_MS = process.env.VITEST ? 0 : 1500;
-let lastCfRequestTime = 0;
-
 async function throttledFetch<T>(url: string): Promise<T | null> {
-  if (process.env.VITEST) {
-    return null;
-  }
-  const now = Date.now();
-  const diff = now - lastCfRequestTime;
-  if (diff < MIN_INTERVAL_MS) {
-    await new Promise((r) => setTimeout(r, MIN_INTERVAL_MS - diff));
-  }
-  lastCfRequestTime = Date.now();
-
-  try {
-    const res = await fetch(url, { 
-      headers: { 'User-Agent': 'CPCoach-App' },
-      signal: AbortSignal.timeout(3000)
-    });
-    if (!res.ok) return null;
-    const json = (await res.json()) as { status: string; result: T };
-    if (json.status === 'OK') return json.result;
-    return null;
-  } catch {
-    return null;
-  }
+  return requestCodeforcesUrl<T>(url, 3_000, 'normal');
 }
 
 function formatRelativeTime(seconds: number): string {
@@ -136,7 +114,7 @@ export class ContestService {
     let publicContests: any[] | null = null;
     const metaFetchStarted = performance.now();
     try {
-      publicContests = await throttledFetch<any[]>(`${CF_API_BASE}/contest.list?gym=false`);
+      publicContests = await throttledFetch<any[]>('https://codeforces.com/api/contest.list?gym=false');
       if (publicContests && Array.isArray(publicContests)) {
         for (const c of publicContests) {
           if (c.id && c.id < 100000) {

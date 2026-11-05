@@ -28,6 +28,40 @@ afterEach(() => {
 });
 
 describe('Cloudflare notification repository', () => {
+  it('authenticates the worker readiness check and returns its D1 and VAPID status', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return response({
+        status: 'ok',
+        storageReady: true,
+        apiSecretConfigured: true,
+        vapidConfigured: true,
+        vapidPublicKey: 'worker-public-key',
+        schedulerHealthy: false,
+        state: { last_status: null, last_success_at: null },
+        latestRun: null,
+      });
+    });
+    const repository = new CloudflareNotificationRepository(
+      (key) => key === 'CLOUDFLARE_NOTIFICATIONS_URL'
+        ? 'http://127.0.0.1:8787'
+        : key === 'CLOUDFLARE_NOTIFICATIONS_API_SECRET'
+          ? 'worker-test-secret'
+          : undefined,
+      fetcher,
+    );
+
+    await expect(repository.getHealth()).resolves.toMatchObject({
+      storageReady: true,
+      vapidPublicKey: 'worker-public-key',
+      schedulerHealthy: false,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe('http://127.0.0.1:8787/internal/v1/status');
+    expect(new Headers(calls[0]?.init?.headers).get('Authorization')).toBe('Bearer worker-test-secret');
+  });
+
   it('uses the authenticated Worker API for settings and multiple subscription operations', async () => {
     const { ownerId, profile } = createProfile();
     const calls: Array<{ url: string; init?: RequestInit }> = [];
@@ -37,6 +71,7 @@ describe('Cloudflare notification repository', () => {
       if (url.endsWith('/settings/get')) {
         return response({ settings: {
           contestReminders: true,
+          contestReminderOffsets: [30],
           dailyReminders: true,
           reminderTime: '20:00',
           timezone: 'Asia/Hebron',
@@ -45,6 +80,7 @@ describe('Cloudflare notification repository', () => {
       if (url.endsWith('/settings/update')) {
         return response({ success: true, settings: {
           contestReminders: false,
+          contestReminderOffsets: [60, 30],
           dailyReminders: true,
           reminderTime: '20:30',
           timezone: 'Asia/Hebron',
@@ -69,14 +105,16 @@ describe('Cloudflare notification repository', () => {
     };
 
     expect(await repository.getSettings(profile.id, ownerId, profile.handle)).toMatchObject({
+      contestReminderOffsets: [30],
       reminderTime: '20:00',
       timezone: 'Asia/Hebron',
     });
     expect(await repository.updateSettings(profile.id, ownerId, profile.handle, {
       contestReminders: false,
+      contestReminderOffsets: [60, 30],
       dailyReminders: true,
       reminderTime: '20:30',
-    })).toMatchObject({ reminderTime: '20:30' });
+    })).toMatchObject({ contestReminderOffsets: [60, 30], reminderTime: '20:30' });
     await repository.registerSubscription(profile.id, ownerId, profile.handle, subscription);
     expect(await repository.hasSubscription(profile.id, ownerId, profile.handle, endpoint)).toBe(true);
     expect(await repository.removeSubscription(profile.id, ownerId, profile.handle, endpoint)).toBe(true);

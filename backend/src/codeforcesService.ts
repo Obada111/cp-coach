@@ -1,78 +1,15 @@
 import { db, updateProfileMeta, getProfileByHandle, syncProfileVerifiedAC } from './db.js';
+import { requestCodeforcesApi } from './codeforcesApi.js';
 import { CFUser, CFRatingChange, CFSubmission, CFProblem, SyncStatus } from './types.js';
 import { problemJournalService } from './problemJournalService.js';
 
-const CF_API_BASE = 'https://codeforces.com/api';
-let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL_MS = 1500;
-let requestQueue: Promise<void> = Promise.resolve();
-const REQUEST_TIMEOUT_MS = process.env.CODEFORCES_REQUEST_TIMEOUT_MS
-  ? parseInt(process.env.CODEFORCES_REQUEST_TIMEOUT_MS, 10)
-  : 10_000;
-
-async function throttledFetch<T>(url: string, retries = 3): Promise<T> {
-  // Serialize acquisition of request slots. Without a queue, simultaneous
-  // refresh jobs can observe the same lastRequestTime and issue requests
-  // together after the same delay, violating the Codeforces spacing rule.
-  const previousRequest = requestQueue;
-  let releaseRequestSlot!: () => void;
-  requestQueue = new Promise<void>((resolve) => {
-    releaseRequestSlot = resolve;
-  });
-  await previousRequest;
-
-  const timeSinceLast = Date.now() - lastRequestTime;
-  if (timeSinceLast < MIN_REQUEST_INTERVAL_MS) {
-    await new Promise((resolve) => setTimeout(resolve, MIN_REQUEST_INTERVAL_MS - timeSinceLast));
-  }
-  lastRequestTime = Date.now();
-  releaseRequestSlot();
-
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Personal-CP-Coach/1.0 (Student Training App)',
-      },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-
-    if (!res.ok) {
-      if (res.status === 429 && retries > 0) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        return throttledFetch<T>(url, retries - 1);
-      }
-      const text = await res.text().catch(() => '');
-      throw new Error(`Codeforces API returned HTTP ${res.status}: ${text.slice(0, 150)}`);
-    }
-
-    const data = await res.json() as { status: string; comment?: string; result: T };
-    if (data.status !== 'OK') {
-      throw new Error(data.comment || 'Codeforces API request was unsuccessful');
-    }
-
-    return data.result;
-  } catch (err: any) {
-    if (retries > 0 && (
-      err.name === 'TypeError' ||
-      err.name === 'AbortError' ||
-      err.name === 'TimeoutError' ||
-      err.message?.includes('fetch failed')
-    )) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      return throttledFetch<T>(url, retries - 1);
-    }
-    throw err;
-  }
-}
 
 export class CodeforcesService {
   private isSyncing = false;
 
   async validateHandle(handle: string): Promise<{ valid: boolean; user?: CFUser; error?: string }> {
     try {
-      const results = await throttledFetch<CFUser[]>(
-        `${CF_API_BASE}/user.info?handles=${encodeURIComponent(handle)}`
-      );
+      const results = await requestCodeforcesApi<CFUser[]>('user.info', { handles: handle });
       if (results && results.length > 0) {
         return { valid: true, user: results[0] };
       }
@@ -88,9 +25,7 @@ export class CodeforcesService {
 
   async getUserInfo(handle: string): Promise<CFUser | null> {
     try {
-      const results = await throttledFetch<CFUser[]>(
-        `${CF_API_BASE}/user.info?handles=${encodeURIComponent(handle)}`
-      );
+      const results = await requestCodeforcesApi<CFUser[]>('user.info', { handles: handle });
       if (results && results.length > 0) {
         return results[0];
       }
@@ -103,9 +38,7 @@ export class CodeforcesService {
 
   async getUserRating(handle: string): Promise<CFRatingChange[] | null> {
     try {
-      return await throttledFetch<CFRatingChange[]>(
-        `${CF_API_BASE}/user.rating?handle=${encodeURIComponent(handle)}`
-      );
+      return await requestCodeforcesApi<CFRatingChange[]>('user.rating', { handle });
     } catch (err) {
       console.warn(`Failed to fetch user.rating for ${handle}:`, err);
       throw err;
@@ -114,9 +47,7 @@ export class CodeforcesService {
 
   async getUserStatus(handle: string, count = 3000): Promise<CFSubmission[] | null> {
     try {
-      return await throttledFetch<CFSubmission[]>(
-        `${CF_API_BASE}/user.status?handle=${encodeURIComponent(handle)}&from=1&count=${count}`
-      );
+      return await requestCodeforcesApi<CFSubmission[]>('user.status', { handle, from: 1, count });
     } catch (err) {
       console.warn(`Failed to fetch user.status for ${handle}:`, err);
       throw err;
@@ -124,9 +55,7 @@ export class CodeforcesService {
   }
 
   async getProblemset(): Promise<{ problems: CFProblem[]; problemStatistics: any[] }> {
-    return await throttledFetch<{ problems: CFProblem[]; problemStatistics: any[] }>(
-      `${CF_API_BASE}/problemset.problems`
-    );
+    return await requestCodeforcesApi<{ problems: CFProblem[]; problemStatistics: any[] }>('problemset.problems');
   }
 
   async getOfficialContests(): Promise<Array<{
@@ -136,13 +65,13 @@ export class CodeforcesService {
     durationSeconds?: number;
     phase?: string;
   }> | null> {
-    return await throttledFetch<Array<{
+    return await requestCodeforcesApi<Array<{
       id: number;
       name: string;
       startTimeSeconds: number;
       durationSeconds?: number;
       phase?: string;
-    }>>(`${CF_API_BASE}/contest.list?gym=false`);
+    }>>('contest.list', { gym: false });
   }
 
   async syncAll(handle: string, profileId?: string): Promise<{ success: boolean; message: string; error?: string }> {

@@ -16,5 +16,8 @@
     "backup:db": "node scripts/backup-db.js"
   },
   "author": "Obada",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "supabase": "^3.0.0"
+  }
 }

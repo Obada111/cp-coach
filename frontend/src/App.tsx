@@ -4,7 +4,7 @@ import {
   selectProfile as apiSelectProfile, triggerSync, submitProblemFeedback, fetchHistory,
   fetchProblemJournal, replaceDailyProblem, enqueueReview, fetchReviewQueue, fetchWeeklyGoals, openProblem,
   fetchUpcomingContests,
-  isPublicMode, getPublicHandle, restorePublicContext, capturePublicContext, serverRestarted,
+  isPublicMode, getPublicHandle, restoreLocalSnapshotIfServerEmpty, capturePublicContext,
   saveOfflineDashboard, readOfflineDashboard, setPublicHandle,
   type OfflineDashboardSnapshot,
 } from './api';
@@ -20,14 +20,17 @@ import {
 } from './types';
 import { Onboarding } from './components/Onboarding';
 import { ProblemCard } from './components/ProblemCard';
-import { RatingChart } from './components/RatingChart';
 import { TopicList } from './components/TopicList';
 import { HistoryList } from './components/HistoryList';
 import { ProblemJournalList } from './components/ProblemJournalList';
 import { ReviewQueueCard } from './components/ReviewQueueCard';
 import { SolveSessionModal } from './components/SolveSessionModal';
 import { LazyFeatureBoundary } from './components/RecoverableErrorBoundary';
+import { AppNavigation, type AppTab } from './components/AppNavigation';
+import { DashboardHome } from './components/DashboardHome';
+import { AccountSecurityPanel } from './components/AccountSecurityPanel';
 
+const LazyRatingChart = lazy(() => import('./components/RatingChart').then((module) => ({ default: module.RatingChart })));
 const LazyContestsView = lazy(() => import('./components/ContestsView').then((module) => ({ default: module.ContestsView })));
 const LazySkillTracksView = lazy(() => import('./components/SkillTracksView').then((module) => ({ default: module.SkillTracksView })));
 const LazyKnowledgeJournal = lazy(() => import('./components/KnowledgeJournal').then((module) => ({ default: module.KnowledgeJournal })));
@@ -35,18 +38,24 @@ const LazyWeeklyCoachReport = lazy(() => import('./components/WeeklyCoachReport'
 const LazyNotificationsSettings = lazy(() => import('./components/NotificationsSettings').then((module) => ({ default: module.NotificationsSettings })));
 const LazyDataBackupPanel = lazy(() => import('./components/DataBackupPanel').then((module) => ({ default: module.DataBackupPanel })));
 const LazyGettingStartedHelp = lazy(() => import('./components/GettingStartedHelp').then((module) => ({ default: module.GettingStartedHelp })));
+const LazySocialHub = lazy(() => import('./components/SocialHub').then((module) => ({ default: module.SocialHub })));
 import { getRankColor, formatDateHebron, formatRelativeTimeAgo } from './utils';
 import {
   RefreshCw, ChevronDown, Flame, TrendingUp, CheckCircle2,
   Calendar, Layers, Settings, Loader2, AlertCircle, UserPlus, Sparkles, Trophy,
-  BrainCircuit, ClipboardList, AlertTriangle, Clock, Compass, RotateCcw, Target, BookOpen, Download
+  BrainCircuit, ClipboardList, AlertTriangle, Clock, Compass, RotateCcw, Target, BookOpen, Download, Users
 } from 'lucide-react';
-
-type Tab = 'home' | 'skill-tracks' | 'reviews' | 'contests' | 'journal' | 'topics' | 'history' | 'settings';
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
+
+function isAppleMobileDevice(): boolean {
+  return typeof navigator !== 'undefined' && (
+    /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  );
 }
 
 export const App: React.FC = () => {
@@ -65,7 +74,7 @@ export const App: React.FC = () => {
   const [loading, setLoading] = useState(() => !initialSnapshot);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('home');
+  const [tab, setTab] = useState<AppTab>('home');
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [creatingProfile, setCreatingProfile] = useState(false);
@@ -103,7 +112,7 @@ export const App: React.FC = () => {
   const [activeSolveProblem, setActiveSolveProblem] = useState<DailyProblem | null>(null);
   const firstPaintMarkedRef = useRef(false);
   const dashboardReadyMarkedRef = useRef(false);
-  const navigateToTab = useCallback((nextTab: Tab) => {
+  const navigateToTab = useCallback((nextTab: AppTab) => {
     startTransition(() => setTab(nextTab));
   }, []);
 
@@ -260,11 +269,11 @@ export const App: React.FC = () => {
       }
       try {
         const publicHandle = isPublicMode ? getPublicHandle() : null;
-        if (publicHandle && await serverRestarted()) {
-          const restore = await restorePublicContext(publicHandle);
+        if (publicHandle) {
+          const restore = await restoreLocalSnapshotIfServerEmpty(publicHandle);
           if (restore.failed) {
             throw new Error(
-              'The backend restarted and this browser\'s saved data could not be restored yet. Your local data is safe; retry in a moment.'
+              'This browser\'s saved snapshot could not be imported yet. Your local data is safe; retry in a moment.'
             );
           }
         }
@@ -388,13 +397,11 @@ export const App: React.FC = () => {
             .catch(() => {});
 
           perfMark('context-check-start');
-          if (await serverRestarted()) {
-            const restore = await restorePublicContext(preferred);
-            if (restore.failed) {
-              throw new Error(
-                'The backend restarted and this browser\'s saved data could not be restored yet. Your local data is safe; retry in a moment.'
-              );
-            }
+          const restore = await restoreLocalSnapshotIfServerEmpty(preferred);
+          if (restore.failed) {
+            throw new Error(
+              'This browser\'s saved snapshot could not be imported yet. Your local data is safe; retry in a moment.'
+            );
           }
           perfMark('context-check-end');
           perfMeasure('context-check', 'context-check-start', 'context-check-end');
@@ -418,13 +425,11 @@ export const App: React.FC = () => {
             (profile) => profile.handle.toLowerCase() === preferred?.toLowerCase()
           ) || target;
           perfMark('context-check-start');
-          if (await serverRestarted()) {
-            const restore = await restorePublicContext(target.handle);
-            if (restore.failed) {
-              throw new Error(
-                'The backend restarted and this browser\'s saved data could not be restored yet. Your local data is safe; retry in a moment.'
-              );
-            }
+          const restore = await restoreLocalSnapshotIfServerEmpty(target.handle);
+          if (restore.failed) {
+            throw new Error(
+              'This browser\'s saved snapshot could not be imported yet. Your local data is safe; retry in a moment.'
+            );
           }
           perfMark('context-check-end');
           perfMeasure('context-check', 'context-check-start', 'context-check-end');
@@ -651,7 +656,7 @@ export const App: React.FC = () => {
     return (
       <div className="min-h-screen flex flex-col">
         <header className="sticky top-0 z-50 bg-[#0c0f1a]/90 backdrop-blur-lg border-b border-slate-800/60">
-          <div className="max-w-4xl mx-auto px-4 h-14 flex items-center justify-between">
+          <div className="mx-auto flex h-14 max-w-[1600px] items-center justify-between px-4 sm:px-6 lg:px-8">
             <div className="flex items-center gap-2">
               <span className="text-sm font-extrabold text-white tracking-tight flex items-center gap-1.5">
                 <Sparkles className="w-4 h-4 text-cyan-400" />
@@ -674,6 +679,7 @@ export const App: React.FC = () => {
               { key: 'journal', icon: BookOpen, label: 'Knowledge Journal' },
               { key: 'topics', icon: Layers, label: 'Topics' },
               { key: 'history', icon: Calendar, label: 'History' },
+              { key: 'social', icon: Users, label: 'Friends' },
               { key: 'settings', icon: Settings, label: 'Settings' },
             ]).map((item) => (
               <span key={item.key} className="flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-medium border-b-2 border-transparent text-slate-600 whitespace-nowrap">
@@ -733,7 +739,7 @@ export const App: React.FC = () => {
     <div className="min-h-screen flex flex-col">
       {/* ═══ Top Bar ═══ */}
       <header className="sticky top-0 z-50 bg-[#0c0f1a]/90 backdrop-blur-lg border-b border-slate-800/60">
-        <div className="max-w-4xl mx-auto px-4 h-14 flex items-center justify-between">
+        <div className="mx-auto flex h-14 max-w-[1600px] items-center justify-between px-4 sm:px-6 lg:px-8">
           {/* Left: logo + profile switcher */}
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2">
@@ -839,37 +845,9 @@ export const App: React.FC = () => {
         </div>
       </header>
 
-      {/* ═══ Tab Navigation ═══ */}
-      <nav aria-label="Main sections" className="border-b border-slate-800/40 bg-[#0c0f1a]/60 backdrop-blur-sm">
-        <div className="max-w-4xl mx-auto px-4 flex gap-1 overflow-x-auto no-scrollbar">
-          {([
-            { key: 'home' as const, icon: Sparkles, label: 'Training Plan' },
-            { key: 'skill-tracks' as const, icon: Compass, label: 'Mastery Map' },
-            { key: 'reviews' as const, icon: RotateCcw, label: `Reviews ${dueCount > 0 ? `(${dueCount})` : ''}` },
-            { key: 'contests' as const, icon: Trophy, label: 'Contests' },
-            { key: 'journal' as const, icon: BookOpen, label: 'Knowledge Journal' },
-            { key: 'topics' as const, icon: Layers, label: 'Topics' },
-            { key: 'history' as const, icon: Calendar, label: 'History' },
-            { key: 'settings' as const, icon: Settings, label: 'Settings' },
-          ]).map((t) => (
-            <button
-              key={t.key}
-              onClick={() => navigateToTab(t.key)}
-              aria-current={tab === t.key ? 'page' : undefined}
-              className={`flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-medium border-b-2 transition-all whitespace-nowrap ${tab === t.key
-                  ? 'border-cyan-500 text-white font-semibold'
-                  : 'border-transparent text-slate-500 hover:text-slate-300'
-                }`}
-            >
-              <t.icon className="w-3.5 h-3.5" />
-              {t.label}
-            </button>
-          ))}
-        </div>
-      </nav>
-
-      {/* ═══ Content ═══ */}
-      <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-6">
+      <div className="mx-auto w-full max-w-[1600px] flex-1 lg:flex lg:min-h-[calc(100vh-3.5rem)]">
+        <AppNavigation activeTab={tab} dueCount={dueCount} onNavigate={navigateToTab} />
+        <main className="mx-auto w-full min-w-0 max-w-6xl flex-1 px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
         {error && (
           <div role="alert" className="mb-5 flex items-start gap-2 rounded-xl border border-rose-900/60 bg-rose-950/30 p-3 text-xs text-rose-200">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
@@ -883,8 +861,28 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* ──── HOME TAB ──── */}
+        {tab === 'social' && (
+          <LazyFeatureBoundary featureName="Friends & Blogs" onReturnToTraining={() => navigateToTab('home')}>
+            <LazySocialHub />
+          </LazyFeatureBoundary>
+        )}
+
         {tab === 'home' && (
+          <DashboardHome
+            data={data}
+            weeklyGoal={weeklyGoal}
+            dueReviews={dueReviews}
+            dueCount={dueCount}
+            upcomingContests={upcomingContests}
+            isSyncing={syncing}
+            formatContestCountdown={formatContestCountdown}
+            onNavigate={navigateToTab}
+            onSync={handleSync}
+          />
+        )}
+
+        {/* ──── DAILY TRAINING TAB ──── */}
+        {tab === 'training' && (
           <div className="space-y-6">
             <LazyFeatureBoundary featureName="Getting Started Help" onReturnToTraining={() => navigateToTab('home')}>
               <LazyGettingStartedHelp />
@@ -1268,7 +1266,9 @@ export const App: React.FC = () => {
                   Rating Progress
                 </h2>
                 <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800">
-                  <RatingChart ratingHistory={data.ratingHistory} currentRating={user?.rating} />
+                  <React.Suspense fallback={<div className="h-48 sm:h-56" aria-label="Loading rating chart" />}>
+                    <LazyRatingChart ratingHistory={data.ratingHistory} currentRating={user?.rating} />
+                  </React.Suspense>
                 </div>
               </section>
             )}
@@ -1365,6 +1365,7 @@ export const App: React.FC = () => {
         {tab === 'settings' && (
           <div className="space-y-6 max-w-lg">
             <h2 className="text-sm font-bold text-white">Settings</h2>
+            {isPublicMode && <AccountSecurityPanel />}
             <section className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-3" aria-labelledby="install-app-title">
               <div>
                 <h3 id="install-app-title" className="text-xs font-semibold text-slate-200 flex items-center gap-2">
@@ -1377,6 +1378,11 @@ export const App: React.FC = () => {
               </div>
               {appInstalled ? (
                 <p className="text-xs text-emerald-300" role="status">Codeforces Coach is installed on this device.</p>
+              ) : isAppleMobileDevice() ? (
+                <div className="text-xs text-slate-400 space-y-1">
+                  <p>On iPhone or iPad, open this page in Safari, tap <span className="text-slate-200">Share → Add to Home Screen</span>, then launch CP Coach from its Home Screen icon.</p>
+                  <p>To use Web Push, open <span className="text-slate-200">Settings → Notifications</span> from the installed app and allow notifications. Requires a supported iOS/iPadOS version and a ready notification service.</p>
+                </div>
               ) : installPrompt ? (
                 <button
                   type="button"
@@ -1449,11 +1455,11 @@ export const App: React.FC = () => {
             {/* Add friend profile */}
             <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-3">
               <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                {isPublicMode ? 'Add Another Handle on This Browser' : 'Add Another Profile'}
+                {isPublicMode ? 'Add Another Codeforces Handle' : 'Add Another Profile'}
               </h3>
               <p className="text-xs text-slate-500">
                 {isPublicMode
-                  ? 'Each handle gets a separate plan and learning history in this browser. Adding a handle does not sign in or sync data from another device.'
+                  ? 'Each handle gets a separate plan and learning history under your account. Adding a handle does not require another sign-in.'
                   : 'Your friend can have their own training plan with separate problems and feedback.'}
               </p>
               <div className="flex gap-2">
@@ -1482,9 +1488,9 @@ export const App: React.FC = () => {
               <p className="font-medium text-slate-400">Privacy & Security</p>
               {isPublicMode ? (
                 <>
-                  <p>Feedback, notes, journal entries, reviews, and virtual-contest history are tied to the selected handle in this browser. A temporary service cache is also used to calculate recommendations and may be lost when free hosting restarts.</p>
-                  <p>Data does not automatically sync to another browser or device. Clearing this browser's site data can erase the local copy, so export a backup in Settings first. The browser-generated ID is not account authentication or a guarantee of account-level privacy.</p>
-                  <p>When enabled, this device's push subscription and reminder preferences are stored on the backend. The current Free Render deployment keeps notifications disabled until durable storage is configured.</p>
+                  <p>Feedback, notes, journal entries, reviews, and virtual-contest history are stored under your signed-in account and isolated from other accounts.</p>
+                  <p>Your data follows your account to other devices. Browser storage is only a cache; clearing it does not delete the server copy. Export a backup if you also want an independent off-server copy.</p>
+                  <p>When enabled, this device's push subscription and reminder preferences are stored under your account. Push delivery also depends on the notification worker being configured.</p>
                 </>
               ) : (
                 <>
@@ -1495,7 +1501,8 @@ export const App: React.FC = () => {
             </div>
           </div>
         )}
-      </main>
+        </main>
+      </div>
 
       {/* ── Solve Session Modal ── */}
       {activeSolveProblem && (
@@ -1514,7 +1521,7 @@ export const App: React.FC = () => {
 
       {/* ═══ Footer ═══ */}
       <footer className="py-3 text-center text-[11px] text-slate-700 border-t border-slate-800/30">
-        CP Coach · {isPublicMode ? 'Browser-local data' : 'Local'} · Asia/Hebron timezone
+        CP Coach · {isPublicMode ? 'Account-synced data' : 'Local'} · Asia/Hebron timezone
       </footer>
     </div>
   );

@@ -11,7 +11,7 @@
     "cpu_ms": 10
   },
   "triggers": {
-    "crons": ["*/5 * * * *"]
+    "crons": ["* * * * *"]
   },
   "d1_databases": [
     {

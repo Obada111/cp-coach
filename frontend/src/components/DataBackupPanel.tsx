@@ -51,7 +51,7 @@ export const DataBackupPanel: React.FC<Props> = ({ enabled, onImported }) => {
       if (file.size > MAX_BROWSER_BACKUP_BYTES) throw new Error('Backup file is larger than the 10 MB limit.');
       const backup: unknown = JSON.parse(await file.text());
       const action = mode === 'replace' ? 'replace existing learning data' : 'merge with existing learning data';
-      if (!window.confirm(`Import this backup and ${action}? This affects only matching Codeforces profiles in this browser.`)) {
+      if (!window.confirm(`Import this backup and ${action}? This affects only matching Codeforces profiles in your signed-in account.`)) {
         return;
       }
       await importBrowserData(backup, mode);
@@ -72,8 +72,8 @@ export const DataBackupPanel: React.FC<Props> = ({ enabled, onImported }) => {
           <h3 className="text-xs font-semibold text-slate-200">Learning Data Backup</h3>
           <p className="text-xs text-slate-500 mt-1">
             {enabled
-              ? 'Export all saved browser profiles to a versioned JSON file. Keep a copy somewhere safe.'
-              : 'Portable browser backup is available in public browser-local mode. Your local SQLite database remains on this computer.'}
+              ? 'Export your account training profiles to a versioned JSON file for an extra off-server copy. Server backups are managed separately.'
+              : 'Portable browser backup is available in online mode. Your local SQLite database remains on this computer.'}
           </p>
         </div>
       </div>

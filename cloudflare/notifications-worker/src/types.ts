@@ -1,4 +1,5 @@
 import type { DailySnapshotProblem } from './logic';
+import type { ContestReminderOffsetMinutes } from './logic';
 
 export interface Env {
   DB: D1Database;
@@ -13,6 +14,7 @@ export interface NotificationProfile {
   owner_id: string;
   cf_handle: string;
   contest_reminders: number;
+  contest_reminder_offsets: string;
   daily_reminders: number;
   reminder_time: string;
   timezone: string;
@@ -40,6 +42,7 @@ export interface NotificationTask {
   contestId?: number;
   contestName?: string;
   startTimeSeconds?: number;
+  reminderOffsetMinutes?: ContestReminderOffsetMinutes;
   remaining?: number;
   snapshot?: DailySnapshotProblem[];
 }

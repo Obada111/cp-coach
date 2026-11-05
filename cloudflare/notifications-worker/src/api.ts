@@ -1,4 +1,9 @@
-import { isValidHandle, isValidReminderTime, isValidSubscription } from './logic';
+import {
+  isValidHandle,
+  isValidReminderTime,
+  isValidSubscription,
+  parseContestReminderOffsets,
+} from './logic';
 import { NotificationStore } from './store';
 import type { Env } from './types';
 
@@ -65,13 +70,7 @@ function isValidEndpointHash(value: unknown): value is string {
 export async function handleApiRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === '/health' && request.method === 'GET') {
-    const health = await new NotificationStore(env.DB).getHealth();
-    return jsonResponse({
-      status: 'ok',
-      timezone: 'Asia/Hebron',
-      vapidConfigured: Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY),
-      ...health,
-    });
+    return jsonResponse(await getWorkerHealth(env));
   }
 
   const authorization = request.headers.get('authorization') || '';
@@ -92,6 +91,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
 
   const body = await readJson(request);
   if (!body) return jsonResponse({ error: 'A valid JSON request body is required' }, 400);
+  if (url.pathname === '/internal/v1/status') {
+    return jsonResponse(await getWorkerHealth(env));
+  }
   const store = new NotificationStore(env.DB);
   const identity = profileIdentity(body);
 
@@ -101,6 +103,19 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     return saved
       ? jsonResponse({ success: true })
       : jsonResponse({ error: 'Notification profile ownership mismatch' }, 409);
+  }
+
+  async function getWorkerHealth(env: Env): Promise<Record<string, unknown>> {
+    const health = await new NotificationStore(env.DB).getHealth();
+    return {
+      status: 'ok',
+      timezone: 'Asia/Hebron',
+      storageReady: true,
+      apiSecretConfigured: Boolean(env.API_SECRET),
+      vapidConfigured: Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY),
+      vapidPublicKey: env.VAPID_PUBLIC_KEY || null,
+      ...health,
+    };
   }
 
   if (url.pathname === '/internal/v1/profiles/delete') {
@@ -115,9 +130,12 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     if (!profile || profile.cf_handle.toLowerCase() !== identity.handle.toLowerCase()) {
       return jsonResponse({ error: 'Notification profile ownership mismatch' }, 409);
     }
+    const contestReminderOffsets = parseContestReminderOffsets(profile.contest_reminder_offsets);
+    if (!contestReminderOffsets) return jsonResponse({ error: 'Stored contest reminder offsets are invalid' }, 500);
     return jsonResponse({
       settings: {
         contestReminders: Boolean(profile.contest_reminders),
+        contestReminderOffsets,
         dailyReminders: Boolean(profile.daily_reminders),
         reminderTime: profile.reminder_time,
         timezone: profile.timezone,
@@ -126,9 +144,11 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
   }
 
   if (url.pathname === '/internal/v1/settings/update') {
+    const contestReminderOffsets = parseContestReminderOffsets(body.contestReminderOffsets);
     if (
       !identity ||
       typeof body.contestReminders !== 'boolean' ||
+      !contestReminderOffsets ||
       typeof body.dailyReminders !== 'boolean' ||
       !isValidReminderTime(body.reminderTime)
     ) return jsonResponse({ error: 'Invalid notification settings' }, 400);
@@ -138,6 +158,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     }
     const updated = await store.updateSettings(identity.profileId, identity.ownerId, {
       contestReminders: body.contestReminders,
+      contestReminderOffsets,
       dailyReminders: body.dailyReminders,
       reminderTime: body.reminderTime,
     });
@@ -146,6 +167,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       success: true,
       settings: {
         contestReminders: body.contestReminders,
+        contestReminderOffsets,
         dailyReminders: body.dailyReminders,
         reminderTime: body.reminderTime,
         timezone: 'Asia/Hebron',

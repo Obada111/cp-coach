@@ -1,3 +1,4 @@
+import { scopedStorageKey } from './storageScope';
 import { isValidTimestamp, timestampMilliseconds } from './timestamps';
 
 export interface VirtualProblemEvent {
@@ -18,11 +19,11 @@ export interface VirtualContestSession {
 const STORAGE_PREFIX = 'cp-coach:virtual-contest:v1:';
 
 export function virtualContestStorageKey(handle: string, contestId: number): string {
-  return `${STORAGE_PREFIX}${handle.toLowerCase()}:${contestId}`;
+  return scopedStorageKey(`${STORAGE_PREFIX}${handle.toLowerCase()}:${contestId}`);
 }
 
 export function listVirtualContestSessions(handle: string): VirtualContestSession[] {
-  const prefix = `${STORAGE_PREFIX}${handle.toLowerCase()}:`;
+  const prefix = scopedStorageKey(`${STORAGE_PREFIX}${handle.toLowerCase()}:`);
   try {
     const sessions: VirtualContestSession[] = [];
     for (let index = 0; index < window.localStorage.length; index += 1) {

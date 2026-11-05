@@ -2,12 +2,12 @@
 import { createHash } from 'node:crypto';
 
 /**
- * Browser-owned personal state.
+ * Account-owned personal state.
  *
- * The public deployment keeps an ephemeral SQLite database so that the full
- * recommendation/analysis engine can run unchanged. The browser stores the
- * authoritative snapshot of everything personal (assignments, feedback,
- * reviews, reflections and goals) and uploads it after a cold start.
+ * The public deployment persists this state in SQLite on the durable Render
+ * disk (with verified backups) so that the full recommendation/analysis engine
+ * can run unchanged. Browser storage remains a cache; the server copy is
+ * authoritative and is scoped to the authenticated Supabase user.
  */
 export const PUBLIC_CONTEXT_VERSION = 1;
 
