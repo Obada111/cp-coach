@@ -15,7 +15,10 @@
     "db:migrate": "tsx src/cli/database.ts migrate",
     "db:claim": "tsx src/cli/database.ts claim",
     "db:rollback": "tsx src/cli/database.ts rollback",
-    "db:migrations": "tsx src/cli/database.ts migrations"
+    "db:migrations": "tsx src/cli/database.ts migrations",
+    "db:export-legacy": "tsx src/cli/database.ts export-legacy",
+    "db:cloud-backup": "tsx src/cli/database.ts cloud-backup",
+    "db:cloud-verify": "tsx src/cli/database.ts cloud-verify"
   },
   "dependencies": {
     "cors": "^2.8.5",

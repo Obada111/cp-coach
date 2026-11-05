@@ -173,6 +173,50 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args.command === 'export-legacy' || args.command === 'migrate-legacy') {
+    const backupPath = optionalFlag(args, 'source') || 'data/backups/cp_coach-20261103T193419Z-76c51c3b.sqlite';
+    const resolvedPath = path.isAbsolute(backupPath) ? backupPath : path.resolve(process.cwd(), backupPath);
+    const handle = optionalFlag(args, 'handle') || 'Obadajo';
+    const outDir = optionalFlag(args, 'out') || path.resolve(process.cwd(), 'data/legacy-exports');
+    const user = optionalFlag(args, 'user');
+    const upload = args.flags.get('upload') === true;
+    const confirm = args.flags.get('confirm') === true;
+    const { exportLegacyDataFromBackup, uploadLegacySnapshotToSupabase } = await import('./migrateLegacyData.js');
+    const { snapshot, report } = exportLegacyDataFromBackup(resolvedPath, handle, {
+      outDir,
+      upload,
+      confirm,
+      user: user || undefined,
+    });
+    if (upload && confirm && user) {
+      const uploadRes = await uploadLegacySnapshotToSupabase(snapshot, user);
+      report.uploadedToSupabase = uploadRes.success;
+      report.verifiedInDatabase = uploadRes.verified;
+      report.targetUserId = user;
+      report.message = uploadRes.message;
+    }
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  if (args.command === 'cloud-backup') {
+    const { createCloudBackup } = await import('./cloudBackup.js');
+    const outDir = optionalFlag(args, 'out') || path.resolve(process.cwd(), '../backups/supabase');
+    const passphrase = optionalFlag(args, 'passphrase') || undefined;
+    const manifest = await createCloudBackup({ outDir, passphrase });
+    console.log(JSON.stringify({ success: true, manifest }, null, 2));
+    return;
+  }
+
+  if (args.command === 'cloud-verify') {
+    const backupFile = args.positionals[0] || requiredFlag(args, 'file');
+    const { verifyAndTestRestoreBackup } = await import('./cloudBackup.js');
+    const passphrase = optionalFlag(args, 'passphrase') || undefined;
+    const result = verifyAndTestRestoreBackup(path.resolve(process.cwd(), backupFile), passphrase);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   throw new Error(`Unknown command '${args.command}'. Run with --help for usage.`);
 }
 
