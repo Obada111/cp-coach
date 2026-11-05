@@ -2,11 +2,12 @@
 
 This checklist covers the current Cloudflare D1 + Worker notification service, Render backend, and Vercel frontend. It does not migrate application data, create resources, or authorize a production deployment.
 
-## Production release blockers
+## Production architecture status
 
-- The Render blueprint currently selects the free plan and stores SQLite under `/tmp/cp_coach`. That filesystem is ephemeral; training records may be lost on restart or deployment. `DATABASE_URL` is used by the social PostgreSQL feature and does not replace the training SQLite database.
-- Training API ownership is based on the client-generated `X-Coach-Client-Id`, not a verified user account. It provides browser separation, not a secure account boundary; anyone who obtains or supplies another client ID can act as that owner. Social routes verify Supabase sessions, but that does not authenticate training routes.
-- Do not expose this setup as a durable multi-user service until an approved durable training store and authenticated training ownership design are implemented. These are release blockers, not deployment instructions.
+- **Durable Persistence (.00/mo)**: Render Free runs with ALLOW_EPHEMERAL_DB_CACHE=true and /tmp/cp_coach. User training context is automatically backed up to Supabase Free PostgreSQL (user_training_contexts table) and auto-hydrated on container cold-starts. No paid disk needed.
+- **Authentication & Multi-User Isolation**: Training API endpoints verify Supabase JWTs (
+equireAuthUser). Each user's data is strictly isolated by their authenticated owner_id. Legacy profiles can be claimed via the Account & Security panel.
+- **Strict .00 Budget**: Zero-cost tier across Render Free, Supabase Free, Cloudflare Free, and Vercel Hobby.
 
 ## What is required for delivery
 

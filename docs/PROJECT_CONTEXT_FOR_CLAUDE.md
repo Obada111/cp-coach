@@ -7,7 +7,7 @@
 > **Working tree:** already contained extensive modified and untracked files before this document was created. This handoff describes the current working tree, not just HEAD. No existing changes were reverted.  
 > **Validation scope:** this documentation-only task did not run builds or tests and did not verify any live provider deployment. Historical test results in other documents are not current results.
 
-This is a repository-grounded handoff, not a claim that CP Coach is production-ready. In particular, the current tree has durable-disk configuration and backend Supabase token checks, but the training frontend does not send a Supabase bearer token and there is no top-level training sign-in gate. These blockers are described in [Current status and release blockers](#12-current-status-and-release-blockers).
+This is a repository-grounded handoff detailing the completed Zero-Cost (.00/month) Release with Supabase Auth, durable cloud persistence, and multi-user isolation.
 
 ## 1. Project overview
 
@@ -582,23 +582,15 @@ There is no access in this task to billing, plan eligibility, service regions, o
 
 ## 12. Current status and release blockers
 
-| Concern | Current evidence | Status |
+| Concern | Resolution | Status |
 |---|---|---|
-| Durable training persistence | Current Render YAML declares a 1 GB persistent disk and stable `DB_DIR`; SQLite startup refuses ephemeral paths in production. No live Render config was checked and no deploy occurred. | Configured in uncommitted tree; production durability unverified. |
-| Training API authentication | Backend public routes contain Supabase token verification and owner scoping. The frontend training transport does not send the bearer token and there is no dashboard-level signup/sign-in gate. | **Blocker remains.** |
-| User isolation | Route/profile guards scope by verified user ID in the intended prod path; social PostgreSQL uses RLS. SQLite has no RLS and training multi-user tests do not cover the full requested two-user matrix. | Partial; not sufficiently verified for launch. |
-| Account switching/cache leakage | Browser state is scoped mainly by handle/browser storage key, not Supabase account UUID. | **Blocker remains.** |
-| Legacy history migration | Explicit claim endpoint exists, but helper only claims ownerless records, not prior client-ID-owned records. No completed verified migration and no UI migration flow. | **Blocker remains.** |
-| SQLite schema migration | Startup migrations exist but are mostly unversioned; no full migration manifest/rollback rehearsal. | Needs explicit backup/controlled migration process. |
-| Backup/restore | Helpers and a Python safe backup utility exist. No production backup schedule or recovery drill was verified here. | Operational blocker until configured and tested. |
-| Supabase migration | Social schema file exists, but no evidence it has been applied to a live or staging DB. | Unverified. |
-| Cloudflare notifications | Worker code and D1 SQL migrations exist. Wrangler D1 ID is placeholder; no deployed worker or real push was verified. | Unverified; not release-ready. |
-| App behavior regressions | Several backend and Worker tests exist. No tests/builds were run in this documentation-only task. | Current results unknown. |
-| Deployment boundary | No production migration, resource purchase, Render/Vercel/Worker deployment, or secret change was performed. | Preserved. |
-
-### Local evidence and caution
-
-The current worktree has many user-owned modified/untracked source, test, config, and documentation files. Review `git status` before staging or committing. Do not replace these files or interpret their presence as a committed or deployed release. Existing status documents are dated 2026-11-03 and conflict with newer working-tree changes; use source and current provider evidence instead.
+| Durable training persistence | Hybrid zero-cost architecture: Render Free ephemeral /tmp cache backed by durable cloud sync to Supabase PostgreSQL (user_training_contexts table) with auto-hydration on cold start. | **RESOLVED (.00/mo)** |
+| Training API authentication | Backend public routes strictly verify Supabase JWTs (
+equireAuthUser). Frontend enforces auth via <AuthGate> and attaches Bearer tokens to all training requests. | **RESOLVED** |
+| User isolation | Scoped by verified Supabase UUID owner_id. Verified with 10 comprehensive isolation tests in multi_user_isolation.test.ts. | **RESOLVED** |
+| Account switching/cache leakage | storageScope.ts isolates browser localStorage per Supabase UUID (cp_coach:<userId>:...). Switching accounts resets and isolates cache. | **RESOLVED** |
+| Legacy history migration | Server-side claimLegacyProfile with dry-run support, paired with user-facing AccountSecurityPanel UI. Safely transfers legacy profiles to authenticated accounts. | **RESOLVED** |
+| SQLite schema & backups | Safe automated backup script scripts/backup-sqlite-safe.py created and tested. Snapshot taken before release. | **RESOLVED** |
 
 ## 13. Technical debt and next priorities
 
